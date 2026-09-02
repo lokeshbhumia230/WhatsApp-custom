@@ -41,6 +41,11 @@ func adminDevicePageHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "admin-device.html")
 }
 
+func adminSettingsPageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
+	http.ServeFile(w, r, "admin-settings.html")
+}
+
 func adminDevicesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	devicesHandler(w, r)
@@ -81,6 +86,7 @@ func init() {
 	http.HandleFunc("/admin", adminPageHandler)
 	http.HandleFunc("/admin/", adminPageHandler)
 	http.HandleFunc("/admin/device", adminHandler(adminDevicePageHandler))
+	http.HandleFunc("/admin/settings", adminHandler(adminSettingsPageHandler))
 	http.HandleFunc("/admin/devices", adminHandler(adminDevicesHandler))
 	http.HandleFunc("/admin/pair", adminHandler(adminPairHandler))
 	http.HandleFunc("/admin/status", adminHandler(adminStatusHandler))
