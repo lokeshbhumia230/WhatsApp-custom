@@ -8,9 +8,7 @@ import (
 	"strings"
 )
 
-func adminToken() string {
-	return strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
-}
+func adminToken() string { return strings.TrimSpace(os.Getenv("ADMIN_TOKEN")) }
 
 func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 	token := adminToken()
@@ -27,88 +25,54 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
 func adminHandler(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		enableCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if !requireAdmin(w, r) {
-			return
-		}
+		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+		if !requireAdmin(w, r) { return }
 		next(w, r)
 	}
 }
 
 func adminPageHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	http.ServeFile(w, r, "admin.html")
 }
 
+func adminDevicePageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
+	http.ServeFile(w, r, "admin-device.html")
+}
+
 func adminDevicesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	devicesHandler(w, r)
 }
-
 func adminPairHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	pairHandler(w, r)
 }
-
 func adminStatusHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	statusHandler(w, r)
 }
-
-func adminLogoutHandler(w http.ResponseWriter, r *http.Request) {
-	logoutHandler(w, r)
-}
-
+func adminLogoutHandler(w http.ResponseWriter, r *http.Request) { logoutHandler(w, r) }
 func adminSendHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	sendHandler(w, r)
 }
 
 func adminReconnectHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+	if r.Method != http.MethodPost && r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	uid := getUserID(r)
-	if uid == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "user_id is required"})
-		return
-	}
-
+	if uid == "" { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "user_id is required"}); return }
 	s := getSession(uid)
 	if s == nil || s.client == nil || !s.client.IsLoggedIn() {
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "No logged-in device found", Connected: false})
 		return
 	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.client.IsConnected() {
-		if err := s.client.Connect(); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: false})
-			return
-		}
+		if err := s.client.Connect(); err != nil { w.WriteHeader(http.StatusServiceUnavailable); _ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: false}); return }
 	}
 	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Reconnect requested", Connected: s.client.IsConnected()})
 }
@@ -116,6 +80,7 @@ func adminReconnectHandler(w http.ResponseWriter, r *http.Request) {
 func init() {
 	http.HandleFunc("/admin", adminPageHandler)
 	http.HandleFunc("/admin/", adminPageHandler)
+	http.HandleFunc("/admin/device", adminHandler(adminDevicePageHandler))
 	http.HandleFunc("/admin/devices", adminHandler(adminDevicesHandler))
 	http.HandleFunc("/admin/pair", adminHandler(adminPairHandler))
 	http.HandleFunc("/admin/status", adminHandler(adminStatusHandler))
