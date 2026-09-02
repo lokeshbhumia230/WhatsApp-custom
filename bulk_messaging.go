@@ -1,10 +1,8 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/csv"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,190 +12,67 @@ import (
 )
 
 func ensureBulkMessageTable() error {
-	_, err := userDB.Exec(`
-		CREATE TABLE IF NOT EXISTS public.bulk_messages(
-			id BIGSERIAL PRIMARY KEY,
-			user_id TEXT,
-			target TEXT NOT NULL,
-			message TEXT NOT NULL,
-			status TEXT NOT NULL DEFAULT 'queued',
-			attempts INTEGER NOT NULL DEFAULT 0,
-			last_error TEXT,
-			assigned_sender TEXT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			sent_at TIMESTAMPTZ
-		);
-		ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS assigned_sender TEXT;
-		ALTER TABLE public.bulk_messages ALTER COLUMN user_id DROP NOT NULL;
-		CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id);
-	`)
+	_, err := userDB.Exec(`CREATE TABLE IF NOT EXISTS public.bulk_messages(id BIGSERIAL PRIMARY KEY,user_id TEXT,target TEXT NOT NULL,message TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,assigned_sender TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),sent_at TIMESTAMPTZ); ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS assigned_sender TEXT; ALTER TABLE public.bulk_messages ALTER COLUMN user_id DROP NOT NULL; CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id)`)
 	return err
 }
 
 func bulkConnectedDevices() []string {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	ids := make([]string, 0, len(manager.sessions))
-	for uid, s := range manager.sessions {
-		if s != nil && s.client != nil && s.client.IsLoggedIn() && s.client.IsConnected() {
-			ids = append(ids, uid)
-		}
-	}
+	manager.mu.RLock(); defer manager.mu.RUnlock()
+	ids:=make([]string,0,len(manager.sessions))
+	for uid,s:=range manager.sessions { if s!=nil&&s.client!=nil&&s.client.IsLoggedIn()&&s.client.IsConnected(){ids=append(ids,uid)} }
 	return ids
 }
 
-func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	if err := ensureBulkMessageTable(); err != nil { w.WriteHeader(http.StatusInternalServerError); return }
-
-	// Stream the multipart body instead of buffering the complete CSV in memory.
-	r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
-	mr, err := r.MultipartReader()
-	if err != nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"Invalid multipart upload"}); return }
-	var file io.Reader
-	for {
-		part, e := mr.NextPart()
-		if e == io.EOF { break }
-		if e != nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"Invalid upload"}); return }
-		if part.FormName() == "file" { file = part; break }
-	}
-	if file == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"CSV file is required"}); return }
-
-	reader := csv.NewReader(file)
-	reader.FieldsPerRecord = -1
-	insert, err := userDB.Prepare(`INSERT INTO public.bulk_messages(user_id,target,message,status) VALUES(NULL,$1,$2,'queued')`)
-	if err != nil { w.WriteHeader(http.StatusInternalServerError); return }
-	defer insert.Close()
-
-	imported, skipped := 0, 0
-	first := true
-	for {
-		rec, e := reader.Read()
-		if e == io.EOF { break }
-		if e != nil { skipped++; continue }
-		if first {
-			first = false
-			if len(rec) > 0 && strings.EqualFold(strings.TrimSpace(rec[0]), "phone") { continue }
+func bulkMessageImportHandler(w http.ResponseWriter,r *http.Request) {
+	enableCORS(w); w.Header().Set("Content-Type","application/json")
+	if r.Method!=http.MethodPost {w.WriteHeader(http.StatusMethodNotAllowed);return}
+	if err:=ensureBulkMessageTable();err!=nil {w.WriteHeader(http.StatusInternalServerError);return}
+	if strings.HasPrefix(r.Header.Get("Content-Type"),"application/json") {
+		var in struct{Action string `json:"action"`;Enabled *bool `json:"enabled"`;UserIDs []string `json:"user_ids"`;Limit int `json:"limit"`}
+		if err:=json.NewDecoder(r.Body).Decode(&in);err!=nil {w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"Invalid request"});return}
+		switch in.Action {
+		case "auto":
+			if in.Enabled==nil {w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"enabled is required"});return}
+			if err:=setAdminSetting("bulk_auto_send_enabled",boolString(*in.Enabled));err!=nil {w.WriteHeader(http.StatusInternalServerError);return}
+			_=json.NewEncoder(w).Encode(map[string]any{"status":"success","auto_send":*in.Enabled});return
+		case "send":
+			limit:=in.Limit;if limit<1{limit=20};if limit>200{limit=200};allowed:=make(map[string]bool)
+			if len(in.UserIDs)==0 {for _,uid:=range bulkConnectedDevices(){allowed[uid]=true}} else {for _,uid:=range in.UserIDs{uid=strings.TrimSpace(uid);s:=getSession(uid);if s!=nil&&s.client!=nil&&s.client.IsLoggedIn()&&s.client.IsConnected(){allowed[uid]=true}}}
+			if len(allowed)==0 {w.WriteHeader(http.StatusServiceUnavailable);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"No connected WhatsApp accounts selected"});return}
+			sent,attempted:=0,0
+			for attempted<limit {uid:=nextBulkSender(allowed,attempted);id,target,text,ok:=claimBulkRow(uid);if !ok{break};attempted++;s:=getSession(uid);if s==nil||s.client==nil{markBulkFailed(id,"WhatsApp account disconnected");continue};s.mu.Lock();err:=safeSendMessage(uid,s.client,types.JID{User:target,Server:types.DefaultUserServer},text);s.mu.Unlock();if err!=nil{markBulkFailed(id,err.Error());continue};_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='sent',sent_at=now(),last_error=NULL WHERE id=$1`,id);sent++}
+			_=json.NewEncoder(w).Encode(map[string]any{"status":"success","attempted":attempted,"sent":sent,"message":"Manual bulk send completed with per-account safety controls."});return
 		}
-		if len(rec) < 3 { skipped++; continue }
-		phone := strings.TrimSpace(strings.TrimPrefix(rec[0], "+"))
-		message := strings.TrimSpace(rec[1])
-		consent := strings.ToLower(strings.TrimSpace(rec[2]))
-		if consent != "yes" && consent != "true" && consent != "1" { skipped++; continue }
-		if phone == "" || message == "" || len(phone) > 20 || len(message) > 10000 { skipped++; continue }
-		if _, e = insert.Exec(phone, message); e != nil { skipped++; continue }
-		imported++
+		w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"Unknown action"});return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"status":"success","imported":imported,"skipped":skipped,"message":"Global messages queued. Safety limits remain enforced per WhatsApp account."})
+
+	r.Body=http.MaxBytesReader(w,r.Body,512<<20)
+	mr,err:=r.MultipartReader();if err!=nil{w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"Invalid multipart upload"});return}
+	var file io.Reader
+	for{part,e:=mr.NextPart();if e==io.EOF{break};if e!=nil{w.WriteHeader(http.StatusBadRequest);return};if part.FormName()=="file"{file=part;break}}
+	if file==nil{w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"CSV file is required"});return}
+	reader:=csv.NewReader(file);reader.FieldsPerRecord=-1
+	insert,err:=userDB.Prepare(`INSERT INTO public.bulk_messages(user_id,target,message,status) VALUES(NULL,$1,$2,'queued')`);if err!=nil{w.WriteHeader(http.StatusInternalServerError);return};defer insert.Close()
+	imported,skipped:=0,0;first:=true
+	for{rec,e:=reader.Read();if e==io.EOF{break};if e!=nil{skipped++;continue};if first{first=false;if len(rec)>0&&strings.EqualFold(strings.TrimSpace(rec[0]),"phone"){continue}};if len(rec)<3{skipped++;continue};phone:=strings.TrimSpace(strings.TrimPrefix(rec[0],"+"));message:=strings.TrimSpace(rec[1]);consent:=strings.ToLower(strings.TrimSpace(rec[2]));if consent!="yes"&&consent!="true"&&consent!="1"{skipped++;continue};if phone==""||message==""||len(phone)>20||len(message)>10000{skipped++;continue};if _,e=insert.Exec(phone,message);e!=nil{skipped++;continue};imported++}
+	_=json.NewEncoder(w).Encode(map[string]any{"status":"success","imported":imported,"skipped":skipped,"message":"Global messages queued. Safety limits remain enforced per WhatsApp account."})
 }
 
-func bulkMessageStatusHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w); w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	if err := ensureBulkMessageTable(); err != nil { w.WriteHeader(http.StatusInternalServerError); return }
-	var queued, sending, sent, failed int
-	_ = userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='queued'`).Scan(&queued)
-	_ = userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='sending'`).Scan(&sending)
-	_ = userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='sent'`).Scan(&sent)
-	_ = userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='failed'`).Scan(&failed)
-	_ = json.NewEncoder(w).Encode(map[string]any{"status":"success","queued":queued,"sending":sending,"sent":sent,"failed":failed,"auto_send":getAdminSetting("bulk_auto_send_enabled","false")=="true","connected_accounts":len(bulkConnectedDevices())})
+func bulkMessageStatusHandler(w http.ResponseWriter,r *http.Request){
+	enableCORS(w);w.Header().Set("Content-Type","application/json");if r.Method!=http.MethodGet{w.WriteHeader(http.StatusMethodNotAllowed);return};if err:=ensureBulkMessageTable();err!=nil{w.WriteHeader(http.StatusInternalServerError);return}
+	var queued,sending,sent,failed int;_=userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='queued'`).Scan(&queued);_=userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='sending'`).Scan(&sending);_=userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='sent'`).Scan(&sent);_=userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE status='failed'`).Scan(&failed)
+	devices:=make([]DeviceInfo,0);for _,uid:=range bulkConnectedDevices(){s:=getSession(uid);if s!=nil&&s.client!=nil&&s.client.Store!=nil&&s.client.Store.ID!=nil{devices=append(devices,DeviceInfo{UserID:uid,Phone:s.client.Store.ID.User,Connected:true,LoggedIn:true,State:"ready"})}}
+	_=json.NewEncoder(w).Encode(map[string]any{"status":"success","queued":queued,"sending":sending,"sent":sent,"failed":failed,"auto_send":getAdminSetting("bulk_auto_send_enabled","false")=="true","connected_accounts":len(devices),"devices":devices})
 }
 
-func bulkDevicesHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w); w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	devices := make([]DeviceInfo, 0)
-	for _, uid := range bulkConnectedDevices() {
-		s := getSession(uid)
-		if s == nil || s.client == nil || s.client.Store == nil || s.client.Store.ID == nil { continue }
-		devices = append(devices, DeviceInfo{UserID:uid, Phone:s.client.Store.ID.User, Connected:true, LoggedIn:true, State:"ready"})
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"status":"success","devices":devices})
-}
-
-func bulkAutoHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w); w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	var in struct{ Enabled *bool `json:"enabled"` }
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Enabled == nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"enabled is required"}); return }
-	if err := setAdminSetting("bulk_auto_send_enabled", boolString(*in.Enabled)); err != nil { w.WriteHeader(http.StatusInternalServerError); return }
-	_ = json.NewEncoder(w).Encode(map[string]any{"status":"success","auto_send":*in.Enabled})
-}
-
-func bulkSendHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w); w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	var in struct { UserIDs []string `json:"user_ids"`; Limit int `json:"limit"` }
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"Invalid request"}); return }
-	limit := in.Limit
-	if limit < 1 { limit = 20 }; if limit > 200 { limit = 200 }
-	allowed := make(map[string]bool)
-	if len(in.UserIDs) == 0 { for _, uid := range bulkConnectedDevices() { allowed[uid] = true } } else { for _, uid := range in.UserIDs { if s:=getSession(strings.TrimSpace(uid)); s!=nil && s.client!=nil && s.client.IsLoggedIn() && s.client.IsConnected() { allowed[strings.TrimSpace(uid)] = true } } }
-	if len(allowed) == 0 { w.WriteHeader(http.StatusServiceUnavailable); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"No connected WhatsApp accounts selected"}); return }
-	sent, attempted := 0, 0
-	for attempted < limit {
-		uid := nextBulkSender(allowed, attempted)
-		if uid == "" { break }
-		id, target, text, ok := claimBulkRow(uid)
-		if !ok { break }
-		attempted++
-		s := getSession(uid)
-		if s == nil || s.client == nil { markBulkFailed(id, "WhatsApp account disconnected"); continue }
-		s.mu.Lock(); err := safeSendMessage(uid, s.client, types.JID{User:target, Server:types.DefaultUserServer}, text); s.mu.Unlock()
-		if err != nil { markBulkFailed(id, err.Error()); continue }
-		_, _ = userDB.Exec(`UPDATE public.bulk_messages SET status='sent',sent_at=now(),last_error=NULL WHERE id=$1`, id)
-		sent++
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"status":"success","attempted":attempted,"sent":sent,"message":"Manual bulk send completed with per-account safety controls."})
-}
-
-func nextBulkSender(allowed map[string]bool, offset int) string {
-	ids := make([]string,0,len(allowed)); for id := range allowed { ids=append(ids,id) }
-	if len(ids)==0 { return "" }
-	return ids[offset%len(ids)]
-}
-
-func claimBulkRow(uid string) (int64,string,string,bool) {
-	tx, err := userDB.Begin(); if err != nil { return 0,"","",false }; defer tx.Rollback()
-	var id int64; var target, text string
-	err = tx.QueryRow(`SELECT id,target,message FROM public.bulk_messages WHERE status='queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id,&target,&text)
-	if err != nil { return 0,"","",false }
-	if _,err=tx.Exec(`UPDATE public.bulk_messages SET status='sending',attempts=attempts+1,assigned_sender=$1 WHERE id=$2`,uid,id);err!=nil{return 0,"","",false}
-	if err=tx.Commit();err!=nil{return 0,"","",false}
-	return id,target,text,true
-}
-
-func markBulkFailed(id int64, msg string) { _,_ = userDB.Exec(`UPDATE public.bulk_messages SET status='failed',last_error=$1 WHERE id=$2`,msg,id) }
-
-func processBulkMessagesGlobal() {
-	if getAdminSetting("bulk_auto_send_enabled","false") != "true" { return }
-	ids := bulkConnectedDevices(); if len(ids)==0 { return }
-	limit := safeSettingInt("bulk_batch_size",5,1,20)
-	allowed := make(map[string]bool,len(ids)); for _,uid:=range ids { allowed[uid]=true }
-	for i:=0;i<limit;i++ {
-		uid := nextBulkSender(allowed,i)
-		id,target,text,ok := claimBulkRow(uid); if !ok { return }
-		s:=getSession(uid); if s==nil||s.client==nil { markBulkFailed(id,"WhatsApp account disconnected"); continue }
-		s.mu.Lock(); err:=safeSendMessage(uid,s.client,types.JID{User:target,Server:types.DefaultUserServer},text); s.mu.Unlock()
-		if err!=nil { markBulkFailed(id,err.Error()); continue }
-		_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='sent',sent_at=now(),last_error=NULL WHERE id=$1`,id)
-	}
-}
-
-func bulkWorkerLoop(){
-	for userDB==nil { time.Sleep(2*time.Second) }
-	_ = ensureBulkMessageTable()
-	t:=time.NewTicker(time.Minute); defer t.Stop()
-	for { processBulkMessagesGlobal(); <-t.C }
-}
+func nextBulkSender(allowed map[string]bool,offset int)string{ids:=make([]string,0,len(allowed));for id:=range allowed{ids=append(ids,id)};if len(ids)==0{return ""};return ids[offset%len(ids)]}
+func claimBulkRow(uid string)(int64,string,string,bool){tx,err:=userDB.Begin();if err!=nil{return 0,"","",false};defer tx.Rollback();var id int64;var target,text string;err=tx.QueryRow(`SELECT id,target,message FROM public.bulk_messages WHERE status='queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id,&target,&text);if err!=nil{return 0,"","",false};if _,err=tx.Exec(`UPDATE public.bulk_messages SET status='sending',attempts=attempts+1,assigned_sender=$1 WHERE id=$2`,uid,id);err!=nil{return 0,"","",false};if err=tx.Commit();err!=nil{return 0,"","",false};return id,target,text,true}
+func markBulkFailed(id int64,msg string){_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='failed',last_error=$1 WHERE id=$2`,msg,id)}
+func processBulkMessagesGlobal(){if getAdminSetting("bulk_auto_send_enabled","false")!="true"{return};ids:=bulkConnectedDevices();if len(ids)==0{return};limit:=safeSettingInt("bulk_batch_size",5,1,20);allowed:=make(map[string]bool,len(ids));for _,uid:=range ids{allowed[uid]=true};for i:=0;i<limit;i++{uid:=nextBulkSender(allowed,i);id,target,text,ok:=claimBulkRow(uid);if !ok{return};s:=getSession(uid);if s==nil||s.client==nil{markBulkFailed(id,"WhatsApp account disconnected");continue};s.mu.Lock();err:=safeSendMessage(uid,s.client,types.JID{User:target,Server:types.DefaultUserServer},text);s.mu.Unlock();if err!=nil{markBulkFailed(id,err.Error());continue};_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='sent',sent_at=now(),last_error=NULL WHERE id=$1`,id)}}
+func bulkWorkerLoop(){for userDB==nil{time.Sleep(2*time.Second)};_=ensureBulkMessageTable();t:=time.NewTicker(time.Minute);defer t.Stop();for{processBulkMessagesGlobal();<-t.C}}
 
 func bulkAdminPageHandler(w http.ResponseWriter,r *http.Request){
-	if r.Method!=http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	data:=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>88Task • Bulk Messages</title><style>body{font-family:system-ui;background:#07100d;color:#eaf2ee;margin:0}.wrap{max-width:900px;margin:auto;padding:30px 16px}.card{background:#0d1714;border:1px solid #263832;border-radius:16px;padding:22px;margin:14px 0}.muted{color:#8fa39a;font-size:13px}input,button{padding:11px;border-radius:9px;border:1px solid #31453d}button{background:#25b875;font-weight:800;cursor:pointer}.stats,.devices{display:flex;gap:12px;flex-wrap:wrap}.stat,.device{padding:12px 16px;border:1px solid #263832;border-radius:10px}.device{min-width:210px}label{display:block;margin:12px 0}.danger{color:#ff9d9d}</style></head><body><main class="wrap"><a href="/admin" style="color:#79dfa8">← Admin</a><div class="card"><h1>Bulk Messages</h1><p class="muted">Global campaign queue. Upload CSV columns: <b>phone,message,consent</b>. Consent must be yes, true, or 1. No App User ID is required.</p><input id="file" type="file" accept=".csv,text/csv"><button onclick="upload()">Import CSV</button><div id="msg" class="muted"></div></div><div class="card"><h2>Sending Control</h2><label><input id="auto" type="checkbox" onchange="setAuto()"> Auto Send — distribute queued messages across all connected WhatsApp accounts</label><button onclick="manualSend()">Send Manually</button><p class="muted">Manual mode uses only selected connected accounts. Auto mode uses all connected accounts. Per-account safety limits always remain active; this does not bypass WhatsApp enforcement.</p><div class="devices" id="devices"></div></div><div class="card"><h2>Queue</h2><div class="stats"><div class="stat">Queued: <b id="q">—</b></div><div class="stat">Sending: <b id="sg">—</b></div><div class="stat">Sent: <b id="s">—</b></div><div class="stat">Failed: <b id="f">—</b></div><div class="stat">Connected: <b id="c">—</b></div></div></div></main><script>const token=sessionStorage.getItem('admin_token')||'';let devices=[];const H={'X-Admin-Token':token};async function api(u,o={}){o.headers=Object.assign({},H,o.headers||{});const r=await fetch(u,o);return r.json()}async function upload(){const f=document.getElementById('file').files[0];if(!f){msg.textContent='Select a CSV first';return}const fd=new FormData();fd.append('file',f);msg.textContent='Importing…';const d=await api('/admin/bulk/import',{method:'POST',body:fd});msg.textContent=d.message||('Imported '+(d.imported||0)+' rows');refresh()}async function loadDevices(){const d=await api('/admin/bulk/devices');devices=d.devices||[];devicesEl=document.getElementById('devices');devicesEl.innerHTML=devices.map(x=>'<label class="device"><input type="checkbox" value="'+x.user_id+'"> '+x.phone+'<br><small>'+x.user_id+'</small></label>').join('')||'<span class="muted">No connected accounts</span>';c.textContent=devices.length}async function setAuto(){const d=await api('/admin/bulk/auto',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:auto.checked})});msg.textContent=d.message||('Auto Send '+(auto.checked?'ON':'OFF'))}async function manualSend(){const ids=[...document.querySelectorAll('#devices input:checked')].map(x=>x.value);if(!ids.length){msg.textContent='Select at least one connected account';return}const d=await api('/admin/bulk/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_ids:ids,limit:50})});msg.textContent=d.message||('Sent '+(d.sent||0)+' messages');refresh()}async function refresh(){const d=await api('/admin/bulk/status');if(d.status==='success'){q.textContent=d.queued;sg.textContent=d.sending;s.textContent=d.sent;f.textContent=d.failed;c.textContent=d.connected_accounts;auto.checked=!!d.auto_send}loadDevices()}refresh();setInterval(refresh,10000)</script></body></html>`
+	if r.Method!=http.MethodGet{w.WriteHeader(http.StatusMethodNotAllowed);return}
+	data:=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>88Task • Bulk Messages</title><style>body{font-family:system-ui;background:#07100d;color:#eaf2ee;margin:0}.wrap{max-width:900px;margin:auto;padding:30px 16px}.card{background:#0d1714;border:1px solid #263832;border-radius:16px;padding:22px;margin:14px 0}.muted{color:#8fa39a;font-size:13px}input,button{padding:11px;border-radius:9px;border:1px solid #31453d}button{background:#25b875;font-weight:800;cursor:pointer}.stats,.devices{display:flex;gap:12px;flex-wrap:wrap}.stat,.device{padding:12px 16px;border:1px solid #263832;border-radius:10px}.device{min-width:210px}label{display:block;margin:12px 0}</style></head><body><main class="wrap"><a href="/admin" style="color:#79dfa8">← Admin</a><div class="card"><h1>Bulk Messages</h1><p class="muted">Global campaign queue. Upload CSV columns: <b>phone,message,consent</b>. No App User ID is required. Consent is required.</p><input id="file" type="file" accept=".csv,text/csv"><button onclick="upload()">Import CSV</button><div id="msg" class="muted"></div></div><div class="card"><h2>Sending Control</h2><label><input id="auto" type="checkbox" onchange="setAuto()"> Auto Send — distribute queued messages across all connected WhatsApp accounts</label><button onclick="manualSend()">Send Manually</button><p class="muted">Manual mode uses selected connected accounts. Auto mode uses all connected accounts. Per-account safety controls always remain active and are never bypassed.</p><div class="devices" id="devices"></div></div><div class="card"><h2>Queue</h2><div class="stats"><div class="stat">Queued: <b id="q">—</b></div><div class="stat">Sending: <b id="sg">—</b></div><div class="stat">Sent: <b id="s">—</b></div><div class="stat">Failed: <b id="f">—</b></div><div class="stat">Connected: <b id="c">—</b></div></div></div></main><script>const token=sessionStorage.getItem('admin_token')||'';let devices=[];const H={'X-Admin-Token':token};async function api(u,o={}){o.headers=Object.assign({},H,o.headers||{});const r=await fetch(u,o);return r.json()}async function upload(){const f=document.getElementById('file').files[0];if(!f){msg.textContent='Select a CSV first';return}const fd=new FormData();fd.append('file',f);msg.textContent='Importing…';const d=await api('/admin/bulk/import',{method:'POST',body:fd});msg.textContent=d.message||('Imported '+(d.imported||0)+' rows');refresh()}async function setAuto(){const d=await api('/admin/bulk/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'auto',enabled:auto.checked})});msg.textContent=d.message||('Auto Send '+(auto.checked?'ON':'OFF'))}async function manualSend(){const ids=[...document.querySelectorAll('#devices input:checked')].map(x=>x.value);if(!ids.length){msg.textContent='Select at least one connected account';return}const d=await api('/admin/bulk/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'send',user_ids:ids,limit:50})});msg.textContent=d.message||('Sent '+(d.sent||0)+' messages');refresh()}async function refresh(){const d=await api('/admin/bulk/status');if(d.status==='success'){q.textContent=d.queued;sg.textContent=d.sending;s.textContent=d.sent;f.textContent=d.failed;c.textContent=d.connected_accounts;auto.checked=!!d.auto_send;devices=d.devices||[];document.getElementById('devices').innerHTML=devices.map(x=>'<label class="device"><input type="checkbox" value="'+x.user_id+'"> '+x.phone+'<br><small>'+x.user_id+'</small></label>').join('')||'<span class="muted">No connected accounts</span>'}}refresh();setInterval(refresh,10000)</script></body></html>`
 	w.Header().Set("Cache-Control","private, max-age=10");w.Header().Set("Content-Type","text/html; charset=utf-8");_,_=w.Write([]byte(data))
 }
-
-var _ = fmt.Sprintf
-var _ sql.NullString
