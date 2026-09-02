@@ -9,6 +9,7 @@ import (
  "time"
  "fmt"
  "database/sql"
+ "sync"
  _ "github.com/jackc/pgx/v5/stdlib"
  "go.mau.fi/whatsmeow"
  "go.mau.fi/whatsmeow/store/sqlstore"
