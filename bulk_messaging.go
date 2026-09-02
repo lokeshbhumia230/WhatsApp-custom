@@ -16,19 +16,31 @@ import (
 func ensureBulkMessageTable() error {
  stmts:=[]string{
   `CREATE TABLE IF NOT EXISTS public.bulk_messages(id BIGSERIAL PRIMARY KEY,user_id TEXT,target TEXT NOT NULL,message TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,assigned_sender TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),sent_at TIMESTAMPTZ,campaign_id TEXT,dedupe_key TEXT)`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS user_id TEXT`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS phone TEXT`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS target TEXT`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS message TEXT`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'queued'`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS last_error TEXT`,
   `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS assigned_sender TEXT`,
-  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now()`,
+  `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ`,
   `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS campaign_id TEXT`,
   `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT`,
   `ALTER TABLE public.bulk_messages ALTER COLUMN user_id DROP NOT NULL`,
-  `CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id)`,
-  `CREATE INDEX IF NOT EXISTS bulk_messages_sender_idx ON public.bulk_messages(assigned_sender,status)`,
  }
  for _,q:=range stmts { if _,e:=userDB.Exec(q); e!=nil{return e} }
- // Older deployments may already contain duplicate non-null dedupe keys.
- // Remove only duplicate queue rows, keeping the oldest row, so the unique
- // partial index below can be created safely without losing the campaign data.
+ // Migrate older bulk tables that stored the recipient as phone.
+ if _,e:=userDB.Exec(`UPDATE public.bulk_messages SET target=phone WHERE (target IS NULL OR target='') AND phone IS NOT NULL AND phone<>''`); e!=nil{return e}
+ if _,e:=userDB.Exec(`UPDATE public.bulk_messages SET status='queued' WHERE status IS NULL OR status=''`); e!=nil{return e}
+ if _,e:=userDB.Exec(`UPDATE public.bulk_messages SET attempts=0 WHERE attempts IS NULL`); e!=nil{return e}
+ if _,e:=userDB.Exec(`UPDATE public.bulk_messages SET created_at=now() WHERE created_at IS NULL`); e!=nil{return e}
+ if _,e:=userDB.Exec(`UPDATE public.bulk_messages SET updated_at=now() WHERE updated_at IS NULL`); e!=nil{return e}
  if _,e:=userDB.Exec(`DELETE FROM public.bulk_messages a USING public.bulk_messages b WHERE a.dedupe_key IS NOT NULL AND a.dedupe_key=b.dedupe_key AND a.id>b.id`); e!=nil{return e}
+ if _,e:=userDB.Exec(`CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id)`); e!=nil{return e}
+ if _,e:=userDB.Exec(`CREATE INDEX IF NOT EXISTS bulk_messages_sender_idx ON public.bulk_messages(assigned_sender,status)`); e!=nil{return e}
  if _,e:=userDB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_idx ON public.bulk_messages(dedupe_key) WHERE dedupe_key IS NOT NULL`); e!=nil{return e}
  return nil
 }
@@ -36,7 +48,7 @@ func bulkConnectedDevices() []string { manager.mu.RLock(); defer manager.mu.RUnl
 func normalizeBulkPhone(v string)(string,bool){v=strings.NewReplacer("+",""," ","","-","").Replace(strings.TrimSpace(v));if len(v)<7||len(v)>15{return "",false};for _,c:=range v{if c<'0'||c>'9'{return "",false}};return v,true}
 func bulkKey(c,p,m string)string{h:=sha256.Sum256([]byte(c+"\x00"+p+"\x00"+m));return hex.EncodeToString(h[:])}
 func bulkQueuedCount()int{var n int;_=userDB.QueryRow(`SELECT count(*) FROM public.bulk_messages WHERE user_id IS NULL AND status='queued'`).Scan(&n);return n}
-func claimBulkRow(uid string)(int64,string,string,bool){tx,e:=userDB.Begin();if e!=nil{return 0,"","",false};defer tx.Rollback();var id int64;var target,text string;if e=tx.QueryRow(`SELECT id,target,message FROM public.bulk_messages WHERE user_id IS NULL AND status='queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id,&target,&text);e!=nil{return 0,"","",false};if _,e=tx.Exec(`UPDATE public.bulk_messages SET status='sending',attempts=attempts+1,assigned_sender=$1,updated_at=now() WHERE id=$2`,uid,id);e!=nil{return 0,"","",false};if e=tx.Commit();e!=nil{return 0,"","",false};return id,target,text,true}
+func claimBulkRow(uid string)(int64,string,string,bool){tx,e:=userDB.Begin();if e!=nil{return 0,"","",false};defer tx.Rollback();var id int64;var target,text string;if e=tx.QueryRow(`SELECT id,target,message FROM public.bulk_messages WHERE user_id IS NULL AND status='queued' AND target IS NOT NULL AND target<>'' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id,&target,&text);e!=nil{return 0,"","",false};if _,e=tx.Exec(`UPDATE public.bulk_messages SET status='sending',attempts=attempts+1,assigned_sender=$1,updated_at=now() WHERE id=$2`,uid,id);e!=nil{return 0,"","",false};if e=tx.Commit();e!=nil{return 0,"","",false};return id,target,text,true}
 func markBulkFailed(id int64,msg string){_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='failed',last_error=$1,updated_at=now() WHERE id=$2`,msg,id)}
 func markBulkSent(id int64){_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='sent',sent_at=now(),last_error=NULL,updated_at=now() WHERE id=$1`,id)}
 func bulkSenderForIndex(ids []string,i int)string{if len(ids)==0{return ""};return ids[i%len(ids)]}
