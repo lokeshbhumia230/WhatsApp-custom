@@ -57,7 +57,8 @@ func ensureBulkMessageTable() error {
         `DELETE FROM public.bulk_messages a USING public.bulk_messages b WHERE a.dedupe_key IS NOT NULL AND a.dedupe_key=b.dedupe_key AND a.id>b.id`,
         `CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id)`,
         `CREATE INDEX IF NOT EXISTS bulk_messages_sender_idx ON public.bulk_messages(assigned_sender,status)`,
-        `CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_idx ON public.bulk_messages(dedupe_key) WHERE dedupe_key IS NOT NULL`,
+        `DROP INDEX IF EXISTS public.bulk_messages_dedupe_idx`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_idx ON public.bulk_messages(dedupe_key)`,
     }
     for _, stmt := range stmts {
         if _, err := userDB.Exec(stmt); err != nil {
@@ -194,7 +195,10 @@ func bulkMessageStatusHandler(w http.ResponseWriter, r *http.Request) {
         bulkJSON(w, 405, APIResponse{Status: "error", Message: "Method not allowed"})
         return
     }
-    _ = ensureBulkMessageTable()
+    if err := ensureBulkMessageTable(); err != nil {
+        bulkJSON(w, 500, APIResponse{Status: "error", Message: "Bulk table initialization failed: " + err.Error()})
+        return
+    }
     _, _ = userDB.Exec(`UPDATE public.bulk_messages SET status='queued',assigned_sender=NULL,last_error='Recovered after worker timeout',updated_at=now() WHERE user_id IS NULL AND status='sending' AND updated_at < now()-interval '15 minutes'`)
     out := map[string]any{"status": "success"}
     for _, st := range []string{"queued", "sending", "sent", "failed", "paused", "cancelled"} {
@@ -418,7 +422,7 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
         }
 
         key := bulkKey(campaign, phone, msg)
-        res, insertErr := userDB.Exec(`INSERT INTO public.bulk_messages(user_id,target,phone,message,consent,status,campaign_id,dedupe_key,updated_at) VALUES(NULL,$1,$1,$2,$3,'queued',$4,$5,now()) ON CONFLICT(dedupe_key) DO NOTHING`, phone, msg, cons, campaign, key)
+        res, insertErr := userDB.Exec(`INSERT INTO public.bulk_messages(user_id,target,phone,message,consent,status,campaign_id,dedupe_key,updated_at) VALUES(NULL,$1,$1,$2,$3,'queued',$4,$5,now()) ON CONFLICT DO NOTHING`, phone, msg, cons, campaign, key)
         if insertErr != nil {
             skipped++
             reasons["database insert failed"]++
@@ -436,7 +440,7 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
         imported++
     }
 
-    out := map[string]any{
+    response := map[string]any{
         "status":      "success",
         "campaign_id": campaign,
         "imported":    imported,
@@ -444,9 +448,9 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
         "skip_reasons": reasons,
     }
     if firstDBError != "" {
-        out["first_database_error"] = firstDBError
+        response["first_database_error"] = firstDBError
     }
-    bulkJSON(w, 200, out)
+    bulkJSON(w, 200, response)
 }
 
 func init() {
@@ -459,5 +463,12 @@ func bulkAdminPageHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
     w.Header().Set("Content-Type", "text/html; charset=utf-8")
-    _, _ = w.Write([]byte(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>88Task • Bulk Messages</title><style>body{font:14px system-ui;margin:0;color:#111}.wrap{max-width:1000px;margin:auto;padding:24px}.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}.btn{padding:9px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;font-weight:700;margin:4px}.primary{background:#111;color:#fff}.acct{display:inline-flex;gap:7px;margin:6px 14px 6px 0}.muted{color:#777}pre{white-space:pre-wrap;background:#f6f6f6;padding:12px;border-radius:8px}</style></head><body><main class="wrap"><h1>Bulk Messages</h1><p class="muted">CSV columns: phone, message, consent. Consent must be yes/true/1.</p><div class="card"><h3>Connected WhatsApp accounts</h3><div id="accounts">Loading…</div></div><div class="card"><input id="f" type="file" accept=".csv"><button class="btn primary" onclick="u()">Import CSV</button><button class="btn" onclick="s()">Send Selected</button><button class="btn" onclick="a('pause')">Pause</button><button class="btn" onclick="a('resume')">Resume</button><button class="btn" onclick="a('retry_failed')">Retry Failed</button><button class="btn" onclick="a('cancel')">Cancel</button><button class="btn" onclick="a('clear_queue')">Clear Queue</button></div><div class="card"><button class="btn" onclick="load()">Refresh Status</button><pre id="o">Loading…</pre></div></main><script>const H=()=>({'X-Admin-Token':sessionStorage.getItem('admin_token')||''});async function api(url,opt={}){opt.headers={...(opt.headers||{}),...H()};let r=await fetch(url,opt),t=await r.text(),d={};try{d=t?JSON.parse(t):{}}catch(e){throw Error('Invalid server response ('+r.status+')')};if(!r.ok)throw Error(d.message||('Request failed ('+r.status+')'));return d}async function load(){try{let d=await api('/admin/bulk/status');o.textContent=JSON.stringify(d,null,2);accounts.innerHTML=(d.devices||[]).map(function(x){return '<label class="acct"><input type="checkbox" value="'+esc(x.user_id)+'" checked> '+esc(x.phone||x.user_id)+'</label>'}).join('')||'<span class="muted">No connected accounts.</span>'}catch(e){o.textContent=e.message}}async function u(){let f=document.getElementById('f').files[0];if(!f)return alert('Select a CSV file');let x=new FormData();x.append('file',f);try{o.textContent=JSON.stringify(await api('/admin/bulk/import',{method:'POST',body:x}),null,2);load()}catch(e){o.textContent=e.message}}async function a(x){try{o.textContent=JSON.stringify(await api('/admin/bulk/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:x})}),null,2);load()}catch(e){o.textContent=e.message}}async function s(){let ids=[...document.querySelectorAll('#accounts input:checked')].map(x=>x.value);if(!ids.length)return alert('Select at least one connected account');try{o.textContent=JSON.stringify(await api('/admin/bulk/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'send',user_ids:ids,limit:200})}),null,2);load()}catch(e){o.textContent=e.message}}function esc(v){return String(v??'').replace(/[&<>'\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]})}if(!sessionStorage.getItem('admin_token'))location.href='/admin';load()</script></body></html>`))
+    _, _ = w.Write([]byte(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>88Task • Bulk Messages</title><style>body{font:14px system-ui;margin:0;color:#111}.wrap{max-width:1000px;margin:auto;padding:24px}.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}.btn{padding:9px 12px;border:1px solid #ccc;border-radius:8px;background:#fff;font-weight:700;margin:4px}.primary{background:#111;color:#fff}.acct{display:inline-flex;gap:7px;margin:6px 14px 6px 0}.muted{color:#777}pre{white-space:pre-wrap;background:#f6f6f6;padding:12px;border-radius:8px}</style></head><body><main class="wrap"><h1>Bulk Messages</h1><p class="muted">CSV columns: phone, message, consent. Consent must be yes/true/1.</p><div class="card"><h3>Connected WhatsApp accounts</h3><div id="accounts">Loading…</div></div><div class="card"><input id="f" type="file" accept=".csv"><button class="btn primary" onclick="u()">Import CSV</button><button class="btn" onclick="s()">Send Selected</button><button class="btn" onclick="a('pause')">Pause</button><button class="btn" onclick="a('resume')">Resume</button><button class="btn" onclick="a('retry_failed')">Retry Failed</button><button class="btn" onclick="a('cancel')">Cancel</button><button class="btn" onclick="a('clear_queue')">Clear Queue</button></div><div class="card"><button class="btn" onclick="load()">Refresh Status</button><pre id="o">Loading…</pre></div></main><script>const H=()=>({'X-Admin-Token':sessionStorage.getItem('admin_token')||''});async function api(url,opt={}){opt.headers={...(opt.headers||{}),...H()};let r=await fetch(url,opt),t=await r.text(),d={};try{d=t?JSON.parse(t):{}}catch(e){throw Error('Invalid server response ('+r.status+')')};if(!r.ok)throw Error(d.message||('Request failed ('+r.status+')'));return d}async function load(){try{let d=await api('/admin/bulk/status');o.textContent=JSON.stringify(d,null,2);accounts.innerHTML=(d.devices||[]).map(function(x){return '<label class="acct"><input type="checkbox" value="'+esc(x.user_id)+'" checked> '+esc(x.phone||x.user_id)+'</label>'}).join('')||'<span class="muted">No connected accounts.</span>'}catch(e){o.textContent=e.message}}async function u(){let f=document.getElementById('f').files[0];if(!f)return alert('Select a CSV file');let x=new FormData();x.append('file',f);try{o.textContent=JSON.stringify(await api('/admin/bulk/import',{method:'POST',body:x}),null,2);load()}catch(e){o.textContent=e.message}}async function a(x){try{o.textContent=JSON.stringify(await api('/admin/bulk/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:x})}),null,2);load()}catch(e){o.textContent=e.message}}async function s(){let ids=[...document.querySelectorAll('#accounts input:checked')].map(x=>x.value);if(!ids.length)return alert('Select at least one connected account');try{o.textContent=JSON.stringify(await api('/admin/bulk/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'send',user_ids:ids,limit:200})}),null,2);load()}catch(e){o.textContent=e.message}}function esc(v){return String(v??'').replace(/[&<>'\"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]})}if(!sessionStorage.getItem('admin_token')){location.href='/admin'}else{load()}</script></body></html>`))
+}
+
+func registerBulkRoutes() {
+    http.HandleFunc("/admin/bulk", adminGuard(bulkAdminPageHandler))
+    http.HandleFunc("/admin/bulk/", adminGuard(bulkAdminPageHandler))
+    http.HandleFunc("/admin/bulk/status", adminGuard(bulkMessageStatusHandler))
+    http.HandleFunc("/admin/bulk/import", adminGuard(bulkMessageImportHandler))
 }
