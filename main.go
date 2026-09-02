@@ -1,27 +1,22 @@
 package main
 
 import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
-	"time"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types"
-	waLog "go.mau.fi/whatsmeow/util/log"
+ "context"
+ "encoding/json"
+ "net/http"
+ "os"
+ "strings"
+ "time"
+ "fmt"
+ "database/sql"
+ _ "github.com/jackc/pgx/v5/stdlib"
+ "go.mau.fi/whatsmeow"
+ "go.mau.fi/whatsmeow/store/sqlstore"
+ "go.mau.fi/whatsmeow/types"
+ "go.mau.fi/whatsmeow/util/log"
 )
 
-type Session struct { client *whatsmeow.Client; mu sync.Mutex }
-type SessionManager struct { mu sync.RWMutex; sessions map[string]*Session; pending map[string]*Session }
-var ( waContainer *sqlstore.Container; userDB *sql.DB; manager = &SessionManager{sessions: make(map[string]*Session), pending: make(map[string]*Session)} )
-type APIResponse struct { Status string `json:"status"`; Message string `json:"message,omitempty"`; Code string `json:"code,omitempty"`; Connected bool `json:"connected"` }
+type APIResponse struct { Status string `json:"status"`; Message string `json:"message,omitempty"`; Connected bool `json:"connected,omitempty"` }
 type StatusResponse struct { UserID string `json:"user_id"`; LoggedIn bool `json:"logged_in"`; Connected bool `json:"connected"`; State string `json:"state"`; ServerTime string `json:"server_time"` }
 type DeviceInfo struct { UserID string `json:"user_id"`; Phone string `json:"phone,omitempty"`; Connected bool `json:"connected"`; LoggedIn bool `json:"logged_in"`; State string `json:"state"`; UpdatedAt string `json:"updated_at,omitempty"` }
 func enableCORS(w http.ResponseWriter) { w.Header().Set("Access-Control-Allow-Origin","*"); w.Header().Set("Access-Control-Allow-Methods","GET, POST, OPTIONS"); w.Header().Set("Access-Control-Allow-Headers","Content-Type, X-User-ID, X-Admin-Token") }
