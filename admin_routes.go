@@ -8,32 +8,31 @@ import (
 	"strings"
 )
 
-func adminToken() string { return strings.TrimSpace(os.Getenv("ADMIN_TOKEN")) }
+func adminToken() string {
+	return strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
+}
 
-func requireAdmin(w http.ResponseWriter, r *http.Request) {
+func checkAdminToken(r *http.Request) bool {
 	token := adminToken()
 	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
-	if token == "" || provided == "" || subtle.ConstantTimeCompare([]byte(token), []byte(provided)) != 1 {
+	return token != "" && provided != "" && subtle.ConstantTimeCompare([]byte(token), []byte(provided)) == 1
+}
+
+func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if !checkAdminToken(r) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Unauthorized"})
+		return false
 	}
+	return true
 }
 
 func adminHandler(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		enableCORS(w)
 		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
-		before := w
-		_ = before
-		token := adminToken()
-		provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
-		if token == "" || provided == "" || subtle.ConstantTimeCompare([]byte(token), []byte(provided)) != 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Unauthorized"})
-			return
-		}
+		if !requireAdmin(w, r) { return }
 		next(w, r)
 	}
 }
@@ -46,6 +45,7 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request, filename string) {
 	if !strings.Contains(content, "/admin-i18n.js") {
 		content = strings.Replace(content, "</body>", `<script src="/admin-i18n.js"></script></body>`, 1)
 	}
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(content))
 }
