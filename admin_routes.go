@@ -33,7 +33,13 @@ func adminHandler(next http.HandlerFunc) http.HandlerFunc {
 
 func adminPageHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	http.ServeFile(w, r, "admin.html")
+	data, err := os.ReadFile("admin.html")
+	if err != nil { http.Error(w, "Admin page unavailable", http.StatusInternalServerError); return }
+	page := string(data)
+	injection := `<style>.global-admin-menu{position:fixed;top:18px;right:18px;z-index:9999}.global-admin-dots{width:42px;height:42px;border:1px solid #d8d8d8;border-radius:10px;background:#fff;color:#111;font-size:24px;line-height:1;cursor:pointer;box-shadow:0 3px 12px #0001}.global-admin-panel{display:none;position:absolute;right:0;top:49px;width:210px;padding:7px;background:#fff;border:1px solid #ddd;border-radius:12px;box-shadow:0 15px 35px #0002}.global-admin-menu.open .global-admin-panel{display:block}.global-admin-panel button{display:block;width:100%;text-align:left;background:#fff;color:#111;border:0;padding:11px 12px;border-radius:8px;font-weight:650;cursor:pointer}.global-admin-panel button:hover{background:#f4f4f4}.global-admin-panel .danger{color:#b00000}</style><div class="global-admin-menu" id="globalAdminMenu"><button class="global-admin-dots" onclick="toggleGlobalAdminMenu(event)" aria-label="Admin navigation">⋮</button><div class="global-admin-panel"><button onclick="location.href='/admin'">Dashboard</button><button onclick="location.href='/admin#devices'">Devices</button><button onclick="location.href='/admin#pair'">Pair WhatsApp</button><button onclick="location.href='/admin/settings'">Settings</button><button class="danger" onclick="sessionStorage.removeItem('admin_token');location.reload()">Logout</button></div></div><script>function toggleGlobalAdminMenu(e){e.stopPropagation();document.getElementById('globalAdminMenu').classList.toggle('open')}document.addEventListener('click',function(e){if(!e.target.closest('#globalAdminMenu'))document.getElementById('globalAdminMenu').classList.remove('open')});</script>`
+	page = strings.Replace(page, "</body>", injection+"</body>", 1)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(page))
 }
 
 func adminDevicePageHandler(w http.ResponseWriter, r *http.Request) {
