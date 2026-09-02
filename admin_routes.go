@@ -43,13 +43,14 @@ func serveAdminPage(w http.ResponseWriter, r *http.Request, filename string) {
 	if !strings.Contains(content, "/admin-i18n.js") {
 		content = strings.Replace(content, "</body>", `<script src="/admin-i18n.js"></script></body>`, 1)
 	}
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Cache-Control", "private, max-age=30, stale-while-revalidate=60")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(content))
 }
 
 func adminI18nHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
+	w.Header().Set("Cache-Control", "public, max-age=300, stale-while-revalidate=600")
 	http.ServeFile(w, r, "admin-i18n.js")
 }
 
