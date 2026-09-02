@@ -10,32 +10,56 @@ import (
 
 func adminToken() string { return strings.TrimSpace(os.Getenv("ADMIN_TOKEN")) }
 
-func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+func requireAdmin(w http.ResponseWriter, r *http.Request) {
 	token := adminToken()
 	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
 	if token == "" || provided == "" || subtle.ConstantTimeCompare([]byte(token), []byte(provided)) != 1 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Unauthorized"})
-		return false
 	}
-	return true
 }
 
 func adminHandler(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		enableCORS(w)
 		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
-		if !requireAdmin(w, r) { return }
+		before := w
+		_ = before
+		token := adminToken()
+		provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+		if token == "" || provided == "" || subtle.ConstantTimeCompare([]byte(token), []byte(provided)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Unauthorized"})
+			return
+		}
 		next(w, r)
 	}
 }
 
-func adminPageHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; http.ServeFile(w, r, "admin.html") }
-func adminDevicePageHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; http.ServeFile(w, r, "admin-device.html") }
-func adminDevicesPageHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; http.ServeFile(w, r, "admin-devices.html") }
-func adminPairPageHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; http.ServeFile(w, r, "admin-pair.html") }
-func adminSettingsPageHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; http.ServeFile(w, r, "admin-settings.html") }
+func serveAdminPage(w http.ResponseWriter, r *http.Request, filename string) {
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
+	data, err := os.ReadFile(filename)
+	if err != nil { http.Error(w, "Page not found", http.StatusNotFound); return }
+	content := string(data)
+	if !strings.Contains(content, "/admin-i18n.js") {
+		content = strings.Replace(content, "</body>", `<script src="/admin-i18n.js"></script></body>`, 1)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(content))
+}
+
+func adminI18nHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
+	http.ServeFile(w, r, "admin-i18n.js")
+}
+
+func adminPageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin.html") }
+func adminDevicePageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin-device.html") }
+func adminDevicesPageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin-devices.html") }
+func adminPairPageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin-pair.html") }
+func adminSettingsPageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin-settings.html") }
 
 func adminDevicesHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; devicesHandler(w, r) }
 func adminPairHandler(w http.ResponseWriter, r *http.Request) { if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; pairHandler(w, r) }
@@ -57,6 +81,7 @@ func adminReconnectHandler(w http.ResponseWriter, r *http.Request) {
 func init() {
 	http.HandleFunc("/admin", adminPageHandler)
 	http.HandleFunc("/admin/", adminPageHandler)
+	http.HandleFunc("/admin-i18n.js", adminI18nHandler)
 	http.HandleFunc("/admin/device", adminHandler(adminDevicePageHandler))
 	http.HandleFunc("/admin/devices", adminHandler(adminDevicesPageHandler))
 	http.HandleFunc("/admin/pair", adminHandler(adminPairPageHandler))
