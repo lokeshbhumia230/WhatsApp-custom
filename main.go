@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,10 +21,21 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type Session struct {
+	client *whatsmeow.Client
+	mu     sync.Mutex
+}
+
+type SessionManager struct {
+	mu       sync.RWMutex
+	sessions map[string]*Session
+	pending  map[string]*Session
+}
+
 var (
-	client    *whatsmeow.Client
-	container *sqlstore.Container
-	sessionMu sync.RWMutex
+	waContainer *sqlstore.Container
+	userDB      *sql.DB
+	manager     = &SessionManager{sessions: make(map[string]*Session), pending: make(map[string]*Session)}
 )
 
 type APIResponse struct {
@@ -33,6 +46,7 @@ type APIResponse struct {
 }
 
 type StatusResponse struct {
+	UserID     string `json:"user_id"`
 	LoggedIn   bool   `json:"logged_in"`
 	Connected  bool   `json:"connected"`
 	State      string `json:"state"`
@@ -45,34 +59,132 @@ func enableCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
-func getClient() *whatsmeow.Client {
-	sessionMu.RLock()
-	defer sessionMu.RUnlock()
-	return client
+func getUserID(r *http.Request) string {
+	return strings.TrimSpace(r.URL.Query().Get("user_id"))
+}
+
+func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := getUserID(r)
+	if id == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "user_id is required"})
+		return "", false
+	}
+	return id, true
+}
+
+func getSession(userID string) *Session {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	if s := manager.sessions[userID]; s != nil {
+		return s
+	}
+	return manager.pending[userID]
+}
+
+func createPendingSession(userID string, s *Session) bool {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if manager.sessions[userID] != nil || manager.pending[userID] != nil {
+		return false
+	}
+	manager.pending[userID] = s
+	return true
+}
+
+func setActive(userID string, s *Session) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	delete(manager.pending, userID)
+	manager.sessions[userID] = s
+}
+
+func removeSession(userID string) *Session {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	s := manager.sessions[userID]
+	delete(manager.sessions, userID)
+	delete(manager.pending, userID)
+	return s
+}
+
+func saveUserSession(userID string, jid types.JID) error {
+	_, err := userDB.Exec(`INSERT INTO user_sessions(user_id,jid,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET jid=excluded.jid,updated_at=excluded.updated_at`, userID, jid.String(), time.Now().UTC())
+	return err
+}
+
+func deleteUserSession(userID string) error {
+	_, err := userDB.Exec(`DELETE FROM user_sessions WHERE user_id=?`, userID)
+	return err
+}
+
+func loadSessions(ctx context.Context) error {
+	rows, err := userDB.Query(`SELECT user_id,jid FROM user_sessions`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	devices, err := waContainer.GetAllDevices(ctx)
+	if err != nil {
+		return err
+	}
+	byJID := make(map[string]*types.JID)
+	for _, device := range devices {
+		if device.ID != nil {
+			jid := *device.ID
+			byJID[jid.String()] = device.ID
+		}
+	}
+
+	for rows.Next() {
+		var uid, jidString string
+		if err := rows.Scan(&uid, &jidString); err != nil {
+			return err
+		}
+		jid, err := types.ParseJID(jidString)
+		if err != nil {
+			_ = deleteUserSession(uid)
+			continue
+		}
+		if _, ok := byJID[jid.String()]; !ok {
+			_ = deleteUserSession(uid)
+			continue
+		}
+		device, err := waContainer.GetDevice(ctx, jid)
+		if err != nil || device == nil {
+			_ = deleteUserSession(uid)
+			continue
+		}
+		client := whatsmeow.NewClient(device, waLog.Stdout("Client-"+uid, "INFO", true))
+		if err := client.Connect(); err != nil {
+			continue
+		}
+		manager.sessions[uid] = &Session{client: client}
+	}
+	return rows.Err()
 }
 
 func main() {
+	ctx := context.Background()
 	dbLog := waLog.Stdout("Database", "WARN", true)
+
 	var err error
-	container, err = sqlstore.New(context.Background(), "sqlite3", "file:store.db?_foreign_keys=on", dbLog)
+	waContainer, err = sqlstore.New(ctx, "sqlite3", "file:store.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		panic(err)
 	}
 
-	deviceStore, err := container.GetFirstDevice(context.Background())
+	userDB, err = sql.Open("sqlite3", "file:users.db?_foreign_keys=on")
 	if err != nil {
 		panic(err)
 	}
-
-	clientLog := waLog.Stdout("Client", "INFO", true)
-	newClient := whatsmeow.NewClient(deviceStore, clientLog)
-	if err = newClient.Connect(); err != nil {
+	if _, err = userDB.Exec(`CREATE TABLE IF NOT EXISTS user_sessions (user_id TEXT PRIMARY KEY, jid TEXT NOT NULL UNIQUE, updated_at DATETIME NOT NULL)`); err != nil {
 		panic(err)
 	}
-
-	sessionMu.Lock()
-	client = newClient
-	sessionMu.Unlock()
+	if err = loadSessions(ctx); err != nil {
+		panic(err)
+	}
 
 	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/pair", pairHandler)
@@ -80,7 +192,7 @@ func main() {
 	http.HandleFunc("/status", statusHandler)
 	http.HandleFunc("/logout", logoutHandler)
 
-	fmt.Println("API Server running on port 3000...")
+	fmt.Println("Multi-user WhatsApp API Server running on port 3000...")
 	if err = http.ListenAndServe(":3000", nil); err != nil {
 		panic(err)
 	}
@@ -89,27 +201,24 @@ func main() {
 func statusHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	w.Header().Set("Content-Type", "application/json")
-
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet+", "+http.MethodOptions)
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(StatusResponse{State: "method_not_allowed"})
+		return
+	}
+	uid, ok := requireUserID(w, r)
+	if !ok {
 		return
 	}
 
-	current := getClient()
-	response := StatusResponse{
-		State:      "uninitialized",
-		ServerTime: time.Now().UTC().Format(time.RFC3339Nano),
-	}
-
-	if current != nil {
-		response.LoggedIn = current.IsLoggedIn()
-		response.Connected = current.IsConnected()
+	s := getSession(uid)
+	response := StatusResponse{UserID: uid, State: "not_found", ServerTime: time.Now().UTC().Format(time.RFC3339Nano)}
+	if s != nil && s.client != nil {
+		response.LoggedIn = s.client.IsLoggedIn()
+		response.Connected = s.client.IsConnected()
 		switch {
 		case response.LoggedIn && response.Connected:
 			response.State = "ready"
@@ -119,6 +228,12 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 			response.State = "logged_in"
 		default:
 			response.State = "disconnected"
+		}
+
+		if response.LoggedIn && s.client.Store != nil && s.client.Store.ID != nil {
+			if err := saveUserSession(uid, *s.client.Store.ID); err == nil {
+				setActive(uid, s)
+			}
 		}
 	}
 
@@ -133,20 +248,25 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	uid, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
 
-	current := getClient()
-	connected := current != nil && current.IsConnected()
-	loggedIn := current != nil && current.IsLoggedIn()
+	s := getSession(uid)
+	connected := s != nil && s.client != nil && s.client.IsConnected()
+	loggedIn := s != nil && s.client != nil && s.client.IsLoggedIn()
 	status := "Not Logged In"
 	if loggedIn && connected {
 		status = "Logged In & Ready"
 	} else if loggedIn {
 		status = "Logged In but Disconnected"
 	}
-
-	_ = json.NewEncoder(w).Encode(APIResponse{
-		Status: "success", Message: "API is running. State: " + status, Connected: connected,
-	})
+	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "API is running. State: " + status, Connected: connected})
 }
 
 func pairHandler(w http.ResponseWriter, r *http.Request) {
@@ -157,35 +277,47 @@ func pairHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet+", "+http.MethodOptions)
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Method must be GET"})
 		return
 	}
-
-	phone := r.URL.Query().Get("phone")
+	uid, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	phone := strings.TrimSpace(r.URL.Query().Get("phone"))
 	if phone == "" {
 		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Invalid phone"})
 		return
 	}
 
-	current := getClient()
-	if current == nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Client unavailable"})
-		return
-	}
-	if current.IsLoggedIn() {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Already paired! Use /logout to reset.", Connected: current.IsConnected()})
+	if existing := getSession(uid); existing != nil {
+		if existing.client != nil && existing.client.IsLoggedIn() {
+			_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Already paired! Use /logout to reset.", Connected: existing.client.IsConnected()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Pairing already in progress"})
 		return
 	}
 
-	code, err := current.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	device := waContainer.NewDevice()
+	client := whatsmeow.NewClient(device, waLog.Stdout("Client-"+uid, "INFO", true))
+	if err := client.Connect(); err != nil {
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
+		return
+	}
+	s := &Session{client: client}
+	if !createPendingSession(uid, s) {
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Pairing already in progress"})
+		return
+	}
+
+	code, err := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: current.IsConnected()})
+		removeSession(uid)
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: client.IsConnected()})
 		return
 	}
-
-	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Code: code, Connected: current.IsConnected()})
+	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Code: code, Connected: client.IsConnected(), Message: "Pairing started. Poll /status with the same user_id."})
 }
 
 func sendHandler(w http.ResponseWriter, r *http.Request) {
@@ -196,48 +328,52 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet+", "+http.MethodOptions)
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Method must be GET"})
+		return
+	}
+	uid, ok := requireUserID(w, r)
+	if !ok {
 		return
 	}
 
-	current := getClient()
-	if current == nil || !current.IsLoggedIn() || !current.IsConnected() {
-		connected := current != nil && current.IsConnected()
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Bot is not connected", Connected: connected})
+	s := getSession(uid)
+	if s == nil || s.client == nil || !s.client.IsLoggedIn() || !s.client.IsConnected() {
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Bot is not connected", Connected: false})
 		return
 	}
-
-	phone := r.URL.Query().Get("phone")
+	phone := strings.TrimSpace(r.URL.Query().Get("phone"))
 	text := r.URL.Query().Get("text")
 	if phone == "" || text == "" {
 		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Phone and text are required", Connected: true})
 		return
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.client
+	if !client.IsLoggedIn() || !client.IsConnected() {
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Bot is not connected", Connected: false})
+		return
+	}
+
 	targetJID := types.JID{User: phone, Server: types.DefaultUserServer}
 	ctx := context.Background()
-
-	current.SubscribePresence(ctx, targetJID)
-	current.SendChatPresence(ctx, targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+	client.SubscribePresence(ctx, targetJID)
+	client.SendChatPresence(ctx, targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
 	time.Sleep(time.Duration(2000+rand.Intn(2000)) * time.Millisecond)
-	current.SendChatPresence(ctx, targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
+	client.SendChatPresence(ctx, targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
 
-	_, err := current.SendMessage(ctx, targetJID, &waProto.Message{Conversation: proto.String(text)})
-	if err != nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: current.IsConnected()})
+	if _, err := client.SendMessage(ctx, targetJID, &waProto.Message{Conversation: proto.String(text)}); err != nil {
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: client.IsConnected()})
 		return
 	}
 
 	time.Sleep(2 * time.Second)
-	patch := appstate.BuildDeleteChat(targetJID, time.Now(), nil, true)
-	if err := current.SendAppState(context.Background(), patch); err != nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: current.IsConnected()})
+	if err := client.SendAppState(ctx, appstate.BuildDeleteChat(targetJID, time.Now(), nil, true)); err != nil {
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: client.IsConnected()})
 		return
 	}
-
-	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Sent and chat deleted!", Connected: current.IsConnected()})
+	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Sent and chat deleted!", Connected: client.IsConnected()})
 }
 
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
@@ -248,44 +384,35 @@ func logoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost+", "+http.MethodOptions)
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Method must be POST"})
+		return
+	}
+	uid, ok := requireUserID(w, r)
+	if !ok {
 		return
 	}
 
-	current := getClient()
-	if current == nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Already logged out", Connected: false})
-		return
-	}
-	if !current.IsLoggedIn() {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Already logged out", Connected: current.IsConnected()})
+	s := getSession(uid)
+	if s == nil || s.client == nil {
+		_ = deleteUserSession(uid)
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Already logged out"})
 		return
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	client := s.client
 	ctx := context.Background()
-	if err := current.Logout(ctx); err != nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: current.IsConnected()})
-		return
-	}
-
-	devices, err := container.GetAllDevices(ctx)
-	if err == nil {
-		for _, device := range devices {
-			_ = container.DeleteDevice(ctx, device)
+	if client.IsLoggedIn() {
+		if err := client.Logout(ctx); err != nil {
+			_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: client.IsConnected()})
+			return
 		}
 	}
-
-	newClient := whatsmeow.NewClient(container.NewDevice(), waLog.Stdout("Client", "INFO", true))
-	if err := newClient.Connect(); err != nil {
-		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: fmt.Sprintf("logged out, but failed to prepare a new session: %v", err), Connected: false})
-		return
+	if client.Store != nil && client.Store.ID != nil {
+		_ = waContainer.DeleteDevice(ctx, client.Store)
 	}
-
-	sessionMu.Lock()
-	client = newClient
-	sessionMu.Unlock()
-
-	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Logged out and local session data cleared", Connected: newClient.IsConnected()})
+	_ = deleteUserSession(uid)
+	removeSession(uid)
+	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Logged out and session cleared", Connected: false})
 }
