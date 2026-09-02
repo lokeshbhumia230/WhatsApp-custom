@@ -8,19 +8,11 @@ import (
 	"strings"
 )
 
-func adminToken() string {
-	return normalizeAdminToken(os.Getenv("ADMIN_TOKEN"))
-}
-
-func normalizeAdminToken(v string) string {
-	v = strings.TrimSpace(v)
-	v = strings.Trim(v, "\"'")
-	return strings.TrimSpace(v)
-}
+func adminToken() string { return strings.TrimSpace(os.Getenv("ADMIN_TOKEN")) }
 
 func checkAdminToken(r *http.Request) bool {
 	token := adminToken()
-	provided := normalizeAdminToken(r.Header.Get("X-Admin-Token"))
+	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
 	return token != "" && provided != "" && subtle.ConstantTimeCompare([]byte(token), []byte(provided)) == 1
 }
 
@@ -61,6 +53,18 @@ func adminI18nHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "admin-i18n.js")
 }
 
+func adminAuthStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
+	if !checkAdminToken(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Unauthorized"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Admin authenticated"})
+}
+
 func adminPageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin.html") }
 func adminDevicePageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin-device.html") }
 func adminDevicesPageHandler(w http.ResponseWriter, r *http.Request) { serveAdminPage(w, r, "admin-devices.html") }
@@ -94,7 +98,7 @@ func init() {
 	http.HandleFunc("/admin/settings", adminHandler(adminSettingsPageHandler))
 	http.HandleFunc("/admin/devices/data", adminHandler(adminDevicesHandler))
 	http.HandleFunc("/admin/pair/data", adminHandler(adminPairHandler))
-	http.HandleFunc("/admin/status", adminHandler(adminStatusHandler))
+	http.HandleFunc("/admin/status", adminAuthStatusHandler)
 	http.HandleFunc("/admin/logout", adminHandler(adminLogoutHandler))
 	http.HandleFunc("/admin/reconnect", adminHandler(adminReconnectHandler))
 	http.HandleFunc("/admin/test-send", adminHandler(adminSendHandler))
