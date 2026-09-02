@@ -9,12 +9,18 @@ import (
 )
 
 func adminToken() string {
-	return strings.TrimSpace(os.Getenv("ADMIN_TOKEN"))
+	return normalizeAdminToken(os.Getenv("ADMIN_TOKEN"))
+}
+
+func normalizeAdminToken(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.Trim(v, "\"'")
+	return strings.TrimSpace(v)
 }
 
 func checkAdminToken(r *http.Request) bool {
 	token := adminToken()
-	provided := strings.TrimSpace(r.Header.Get("X-Admin-Token"))
+	provided := normalizeAdminToken(r.Header.Get("X-Admin-Token"))
 	return token != "" && provided != "" && subtle.ConstantTimeCompare([]byte(token), []byte(provided)) == 1
 }
 
