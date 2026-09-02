@@ -1,55 +1,9 @@
 package main
 
-import (
-	"encoding/csv"
-	"encoding/json"
-	"io"
-	"net/http"
-	"strings"
-	"time"
-
-	"go.mau.fi/whatsmeow/types"
-)
-
-func ensureBulkMessageTable() error {
-	_, err := userDB.Exec(`CREATE TABLE IF NOT EXISTS public.bulk_messages(
-		id BIGSERIAL PRIMARY KEY,
-		user_id TEXT NOT NULL,
-		target TEXT NOT NULL,
-		message TEXT NOT NULL,
-		status TEXT NOT NULL DEFAULT 'queued',
-		attempts INTEGER NOT NULL DEFAULT 0,
-		last_error TEXT,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		sent_at TIMESTAMPTZ
-	); CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(user_id,status,id)`)
-	return err
-}
-
-func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w); w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost { w.WriteHeader(http.StatusMethodNotAllowed); return }
-	uid, ok := requireUserID(w, r); if !ok { return }
-	if err := ensureBulkMessageTable(); err != nil { w.WriteHeader(http.StatusInternalServerError); return }
-	if err := r.ParseMultipartForm(128 << 20); err != nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"Invalid upload"}); return }
-	f, _, err := r.FormFile("file"); if err != nil { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"CSV file is required"}); return }; defer f.Close()
-	reader := csv.NewReader(f); reader.FieldsPerRecord = -1
-	insert, err := userDB.Prepare(`INSERT INTO public.bulk_messages(user_id,target,message,status) VALUES($1,$2,$3,'queued')`); if err != nil { w.WriteHeader(http.StatusInternalServerError); return }; defer insert.Close()
-	imported, skipped := 0, 0; first := true
-	for { rec,e:=reader.Read(); if e==io.EOF{break}; if e!=nil{skipped++;continue}; if first{first=false;if len(rec)>0&&strings.EqualFold(strings.TrimSpace(rec[0]),"phone"){continue}}
-		if len(rec)<3{skipped++;continue}; phone:=strings.TrimSpace(strings.TrimPrefix(rec[0],"+")); message:=strings.TrimSpace(rec[1]); consent:=strings.ToLower(strings.TrimSpace(rec[2]))
-		if consent!="yes"&&consent!="true"&&consent!="1"{skipped++;continue}; if phone==""||message==""||len(phone)>20||len(message)>10000{skipped++;continue}
-		if _,e=insert.Exec(uid,phone,message);e!=nil{skipped++;continue}; imported++
-	}
-	_=json.NewEncoder(w).Encode(map[string]any{"status":"success","imported":imported,"skipped":skipped,"message":"Messages queued. Safety limits still apply."})
-}
-
+import("encoding/csv";"encoding/json";"io";"net/http";"strings";"time";"go.mau.fi/whatsmeow/types")
+func ensureBulkMessageTable()error{_,err:=userDB.Exec(`CREATE TABLE IF NOT EXISTS public.bulk_messages(id BIGSERIAL PRIMARY KEY,user_id TEXT NOT NULL,target TEXT NOT NULL,message TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),sent_at TIMESTAMPTZ); CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(user_id,status,id)`);return err}
+func bulkMessageImportHandler(w http.ResponseWriter,r *http.Request){enableCORS(w);w.Header().Set("Content-Type","application/json");if r.Method!=http.MethodPost{w.WriteHeader(http.StatusMethodNotAllowed);return};uid,ok:=requireUserID(w,r);if !ok{return};if err:=ensureBulkMessageTable();err!=nil{w.WriteHeader(http.StatusInternalServerError);return};if err:=r.ParseMultipartForm(128<<20);err!=nil{w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"Invalid upload"});return};f,_,err:=r.FormFile("file");if err!=nil{w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"CSV file is required"});return};defer f.Close();reader:=csv.NewReader(f);reader.FieldsPerRecord=-1;insert,err:=userDB.Prepare(`INSERT INTO public.bulk_messages(user_id,target,message,status) VALUES($1,$2,$3,'queued')`);if err!=nil{w.WriteHeader(http.StatusInternalServerError);return};defer insert.Close();imported,skipped:=0,0;first:=true;for{rec,e:=reader.Read();if e==io.EOF{break};if e!=nil{skipped++;continue};if first{first=false;if len(rec)>0&&strings.EqualFold(strings.TrimSpace(rec[0]),"phone"){continue}};if len(rec)<3{skipped++;continue};phone:=strings.TrimSpace(strings.TrimPrefix(rec[0],"+"));message:=strings.TrimSpace(rec[1]);consent:=strings.ToLower(strings.TrimSpace(rec[2]));if consent!="yes"&&consent!="true"&&consent!="1"{skipped++;continue};if phone==""||message==""||len(phone)>20||len(message)>10000{skipped++;continue};if _,e=insert.Exec(uid,phone,message);e!=nil{skipped++;continue};imported++};_=json.NewEncoder(w).Encode(map[string]any{"status":"success","imported":imported,"skipped":skipped,"message":"Messages queued. Safety limits still apply."})}
 func bulkMessageStatusHandler(w http.ResponseWriter,r *http.Request){enableCORS(w);w.Header().Set("Content-Type","application/json");if r.Method!=http.MethodGet{w.WriteHeader(http.StatusMethodNotAllowed);return};uid,ok:=requireUserID(w,r);if !ok{return};if err:=ensureBulkMessageTable();err!=nil{w.WriteHeader(http.StatusInternalServerError);return};var queued,sent,failed int;_=userDB.QueryRow(`SELECT count(*) FROM bulk_messages WHERE user_id=$1 AND status='queued'`,uid).Scan(&queued);_=userDB.QueryRow(`SELECT count(*) FROM bulk_messages WHERE user_id=$1 AND status='sent'`,uid).Scan(&sent);_=userDB.QueryRow(`SELECT count(*) FROM bulk_messages WHERE user_id=$1 AND status='failed'`,uid).Scan(&failed);_=json.NewEncoder(w).Encode(map[string]any{"status":"success","queued":queued,"sent":sent,"failed":failed})}
-
-func processBulkMessages(uid string){if getAdminSetting("bulk_auto_send_enabled","false")!="true"{return};s:=getSession(uid);if s==nil||s.client==nil||!s.client.IsLoggedIn()||!s.client.IsConnected(){return};for i:=0;i<safeSettingInt("bulk_batch_size",5,1,20);i++{var id int64;var target,text string;err:=userDB.QueryRow(`SELECT id,target,message FROM bulk_messages WHERE user_id=$1 AND status='queued' ORDER BY id LIMIT 1`,uid).Scan(&id,&target,&text);if err!=nil{return};res,err:=userDB.Exec(`UPDATE bulk_messages SET status='sending',attempts=attempts+1 WHERE id=$1 AND status='queued'`,id);if err!=nil{return};n,_:=res.RowsAffected();if n!=1{continue};s.mu.Lock();err=safeSendMessage(uid,s.client,types.JID{User:target,Server:types.DefaultUserServer},text);s.mu.Unlock();if err!=nil{_,_=userDB.Exec(`UPDATE bulk_messages SET status='failed',last_error=$1 WHERE id=$2`,err.Error(),id);continue};_,_=userDB.Exec(`UPDATE bulk_messages SET status='sent',sent_at=now(),last_error=NULL WHERE id=$1`,id)}}
-
-func bulkWorkerLoop(){for userDB==nil{time.Sleep(2*time.Second)};_=ensureBulkMessageTable();t:=time.NewTicker(time.Minute);defer t.Stop();for{rows,err:=userDB.Query(`SELECT DISTINCT user_id FROM bulk_messages WHERE status='queued' LIMIT 100`);if err==nil{var ids []string;for rows.Next(){var id string;if rows.Scan(&id)==nil{ids=append(ids,id)}};rows.Close();for _,uid:=range ids{processBulkMessages(uid)}};<-t.C}}
-
+func processBulkMessages(uid string){if getAdminSetting("bulk_auto_send_enabled","false")!="true"{return};s:=getSession(uid);if s==nil||s.client==nil||!s.client.IsLoggedIn()||!s.client.IsConnected(){return};for i:=0;i<safeSettingInt("bulk_batch_size",5,1,20);i++{var id int64;var target,text string;err:=userDB.QueryRow(`SELECT id,target,message FROM public.bulk_messages WHERE user_id=$1 AND status='queued' ORDER BY id LIMIT 1`,uid).Scan(&id,&target,&text);if err!=nil{return};res,err:=userDB.Exec(`UPDATE public.bulk_messages SET status='sending',attempts=attempts+1 WHERE id=$1 AND status='queued'`,id);if err!=nil{return};n,_:=res.RowsAffected();if n!=1{continue};s.mu.Lock();err=safeSendMessage(uid,s.client,types.JID{User:target,Server:types.DefaultUserServer},text);s.mu.Unlock();if err!=nil{_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='failed',last_error=$1 WHERE id=$2`,err.Error(),id);continue};_,_=userDB.Exec(`UPDATE public.bulk_messages SET status='sent',sent_at=now(),last_error=NULL WHERE id=$1`,id)}}
+func bulkWorkerLoop(){for userDB==nil{time.Sleep(2*time.Second)};_=ensureBulkMessageTable();t:=time.NewTicker(time.Minute);defer t.Stop();for{rows,err:=userDB.Query(`SELECT DISTINCT user_id FROM public.bulk_messages WHERE status='queued' LIMIT 100`);if err==nil{var ids []string;for rows.Next(){var id string;if rows.Scan(&id)==nil{ids=append(ids,id)}};rows.Close();for _,uid:=range ids{processBulkMessages(uid)}};<-t.C}}
 func bulkAdminPageHandler(w http.ResponseWriter,r *http.Request){if r.Method!=http.MethodGet{w.WriteHeader(http.StatusMethodNotAllowed);return};data:=`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>88Task • Bulk Messages</title><style>body{font-family:system-ui;background:#07100d;color:#eaf2ee;margin:0}.wrap{max-width:800px;margin:auto;padding:30px 16px}.card{background:#0d1714;border:1px solid #263832;border-radius:16px;padding:22px}.muted{color:#8fa39a;font-size:13px}input,button{padding:11px;border-radius:9px;border:1px solid #31453d}button{background:#25b875;font-weight:800;cursor:pointer}.row{margin:18px 0}.stats{display:flex;gap:15px;flex-wrap:wrap}.stat{padding:12px 16px;border:1px solid #263832;border-radius:10px}</style></head><body><main class="wrap"><a href="/admin" style="color:#79dfa8">← Admin</a><div class="card"><h1>Bulk Messages</h1><p class="muted">Upload CSV columns: phone,message,consent. Consent must be yes, true, or 1. Rows are streamed into a server-side queue and safety limits remain active.</p><div class="row"><input id="file" type="file" accept=".csv,text/csv"><button onclick="upload()">Import CSV</button></div><div id="msg" class="muted"></div><div class="stats"><div class="stat">Queued: <b id="q">—</b></div><div class="stat">Sent: <b id="s">—</b></div><div class="stat">Failed: <b id="f">—</b></div></div></div></main><script>const token=sessionStorage.getItem('admin_token')||'';const uid=new URLSearchParams(location.search).get('user_id')||prompt('App User ID:');async function upload(){const f=document.getElementById('file').files[0];if(!f||!uid)return;const fd=new FormData();fd.append('file',f);msg.textContent='Importing…';const r=await fetch('/admin/bulk/import?user_id='+encodeURIComponent(uid),{method:'POST',headers:{'X-Admin-Token':token},body:fd});const d=await r.json();msg.textContent=d.message||'Imported '+(d.imported||0)+' rows';refresh()}async function refresh(){const r=await fetch('/admin/bulk/status?user_id='+encodeURIComponent(uid),{headers:{'X-Admin-Token':token}});const d=await r.json();if(d.status==='success'){q.textContent=d.queued;s.textContent=d.sent;f.textContent=d.failed}}refresh();setInterval(refresh,10000)</script></body></html>`;w.Header().Set("Content-Type","text/html; charset=utf-8");_,_=w.Write([]byte(data))}
-
-func init(){http.HandleFunc("/admin/bulk",adminHandler(bulkAdminPageHandler));http.HandleFunc("/admin/bulk/import",adminHandler(bulkMessageImportHandler));http.HandleFunc("/admin/bulk/status",adminHandler(bulkMessageStatusHandler));go bulkWorkerLoop()}
