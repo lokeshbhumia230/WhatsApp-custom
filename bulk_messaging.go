@@ -5,6 +5,7 @@ import (
     "encoding/csv"
     "encoding/hex"
     "encoding/json"
+    "fmt"
     "io"
     "net/http"
     "sort"
@@ -14,9 +15,6 @@ import (
     "go.mau.fi/whatsmeow/types"
 )
 
-// ensureBulkMessageTable keeps the bulk queue compatible with older deployments.
-// The queue has existed in a few schema variants, so every column used by the
-// current worker/importer is explicitly ensured before an import is attempted.
 func ensureBulkMessageTable() error {
     stmts := []string{
         `CREATE TABLE IF NOT EXISTS public.bulk_messages (
@@ -52,13 +50,14 @@ func ensureBulkMessageTable() error {
         `ALTER TABLE public.bulk_messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT`,
         `ALTER TABLE public.bulk_messages ALTER COLUMN user_id DROP NOT NULL`,
         `UPDATE public.bulk_messages SET target=phone WHERE (target IS NULL OR target='') AND phone IS NOT NULL AND phone<>''`,
-        `UPDATE public.bulk_messages SET attempts=0 WHERE attempts IS NULL`,
         `UPDATE public.bulk_messages SET status='queued' WHERE status IS NULL OR status=''`,
+        `UPDATE public.bulk_messages SET attempts=0 WHERE attempts IS NULL`,
         `UPDATE public.bulk_messages SET created_at=now() WHERE created_at IS NULL`,
         `UPDATE public.bulk_messages SET updated_at=now() WHERE updated_at IS NULL`,
-        `DELETE FROM public.bulk_messages a USING public.bulk_messages b WHERE a.dedupe_key IS NOT NULL AND a.dedupe_key=b.dedupe_key AND a.ctid>b.ctid`,
-        `CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_uidx ON public.bulk_messages (dedupe_key) WHERE dedupe_key IS NOT NULL`,
-        `CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages (status, id)`,
+        `DELETE FROM public.bulk_messages a USING public.bulk_messages b WHERE a.dedupe_key IS NOT NULL AND a.dedupe_key=b.dedupe_key AND a.id>b.id`,
+        `CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id)`,
+        `CREATE INDEX IF NOT EXISTS bulk_messages_sender_idx ON public.bulk_messages(assigned_sender,status)`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_idx ON public.bulk_messages(dedupe_key) WHERE dedupe_key IS NOT NULL`,
     }
     for _, stmt := range stmts {
         if _, err := userDB.Exec(stmt); err != nil {
@@ -113,23 +112,12 @@ func claimBulkRow(uid string) (int64, string, string, bool) {
         return 0, "", "", false
     }
     defer tx.Rollback()
-
     var id int64
     var target, text string
-    err = tx.QueryRow(`
-        SELECT id,target,message
-        FROM public.bulk_messages
-        WHERE user_id IS NULL AND status='queued' AND target IS NOT NULL AND target<>''
-        ORDER BY id
-        FOR UPDATE SKIP LOCKED LIMIT 1`,
-    ).Scan(&id, &target, &text)
-    if err != nil {
+    if err = tx.QueryRow(`SELECT id,target,message FROM public.bulk_messages WHERE user_id IS NULL AND status='queued' AND target IS NOT NULL AND target<>'' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&id, &target, &text); err != nil {
         return 0, "", "", false
     }
-    if _, err = tx.Exec(`
-        UPDATE public.bulk_messages
-        SET status='sending', attempts=attempts+1, assigned_sender=$1, updated_at=now()
-        WHERE id=$2`, uid, id); err != nil {
+    if _, err = tx.Exec(`UPDATE public.bulk_messages SET status='sending',attempts=attempts+1,assigned_sender=$1,updated_at=now() WHERE id=$2`, uid, id); err != nil {
         return 0, "", "", false
     }
     if err = tx.Commit(); err != nil {
@@ -206,6 +194,8 @@ func bulkMessageStatusHandler(w http.ResponseWriter, r *http.Request) {
         bulkJSON(w, 405, APIResponse{Status: "error", Message: "Method not allowed"})
         return
     }
+    _ = ensureBulkMessageTable()
+    _, _ = userDB.Exec(`UPDATE public.bulk_messages SET status='queued',assigned_sender=NULL,last_error='Recovered after worker timeout',updated_at=now() WHERE user_id IS NULL AND status='sending' AND updated_at < now()-interval '15 minutes'`)
     out := map[string]any{"status": "success"}
     for _, st := range []string{"queued", "sending", "sent", "failed", "paused", "cancelled"} {
         var n int
@@ -224,17 +214,9 @@ func bulkMessageStatusHandler(w http.ResponseWriter, r *http.Request) {
     bulkJSON(w, 200, out)
 }
 
-func csvHeaderIndex(headers []string, names ...string) int {
-    for i, h := range headers {
-        h = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(h, "\ufeff")))
-        h = strings.NewReplacer("_", "", "-", "", " ", "").Replace(h)
-        for _, name := range names {
-            if h == strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(name)) {
-                return i
-            }
-        }
-    }
-    return -1
+func normalizeCSVHeader(v string) string {
+    v = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(v, "\ufeff")))
+    return strings.NewReplacer("_", "", "-", "", " ", "").Replace(v)
 }
 
 func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
@@ -258,16 +240,16 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
             bulkJSON(w, 400, APIResponse{Status: "error", Message: "Invalid JSON: " + err.Error()})
             return
         }
-        action := strings.ToLower(strings.TrimSpace(in.Action))
-        if action != "send" {
-            queries := map[string]string{
-                "pause":        `UPDATE public.bulk_messages SET status='paused',updated_at=now() WHERE user_id IS NULL AND status='queued'`,
-                "resume":       `UPDATE public.bulk_messages SET status='queued',updated_at=now() WHERE user_id IS NULL AND status='paused'`,
-                "cancel":       `UPDATE public.bulk_messages SET status='cancelled',updated_at=now() WHERE user_id IS NULL AND status IN ('queued','paused','failed')`,
-                "retry_failed": `UPDATE public.bulk_messages SET status='queued',attempts=0,last_error=NULL,assigned_sender=NULL,updated_at=now() WHERE user_id IS NULL AND status='failed'`,
-                "clear_queue":  `DELETE FROM public.bulk_messages WHERE user_id IS NULL AND status IN ('queued','paused','cancelled','failed')`,
+        a := strings.ToLower(strings.TrimSpace(in.Action))
+        if a != "send" {
+            q := map[string]string{
+                "pause":        "UPDATE public.bulk_messages SET status='paused',updated_at=now() WHERE user_id IS NULL AND status='queued'",
+                "resume":       "UPDATE public.bulk_messages SET status='queued',updated_at=now() WHERE user_id IS NULL AND status='paused'",
+                "cancel":       "UPDATE public.bulk_messages SET status='cancelled',updated_at=now() WHERE user_id IS NULL AND status IN ('queued','paused','failed')",
+                "retry_failed": "UPDATE public.bulk_messages SET status='queued',attempts=0,last_error=NULL,assigned_sender=NULL,updated_at=now() WHERE user_id IS NULL AND status='failed'",
+                "clear_queue":  "DELETE FROM public.bulk_messages WHERE user_id IS NULL AND status IN ('queued','paused','cancelled','failed')",
             }
-            sql, ok := queries[action]
+            sql, ok := q[a]
             if !ok {
                 bulkJSON(w, 400, APIResponse{Status: "error", Message: "Unknown action"})
                 return
@@ -278,7 +260,7 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
                 return
             }
             n, _ := res.RowsAffected()
-            bulkJSON(w, 200, map[string]any{"status": "success", "action": action, "affected": n})
+            bulkJSON(w, 200, map[string]any{"status": "success", "action": a, "affected": n})
             return
         }
 
@@ -307,7 +289,6 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
             bulkJSON(w, 400, APIResponse{Status: "error", Message: "No connected WhatsApp accounts selected"})
             return
         }
-
         sent, attempted := 0, 0
         for attempted < limit {
             uid := bulkSenderForIndex(selected, attempted)
@@ -343,12 +324,12 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
     }
     var file io.Reader
     for {
-        p, err := mr.NextPart()
-        if err == io.EOF {
+        p, nextErr := mr.NextPart()
+        if nextErr == io.EOF {
             break
         }
-        if err != nil {
-            bulkJSON(w, 400, APIResponse{Status: "error", Message: "Invalid multipart data: " + err.Error()})
+        if nextErr != nil {
+            bulkJSON(w, 400, APIResponse{Status: "error", Message: "Invalid multipart data: " + nextErr.Error()})
             return
         }
         if p.FormName() == "file" {
@@ -363,41 +344,41 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
 
     reader := csv.NewReader(file)
     reader.FieldsPerRecord = -1
-    reader.TrimLeadingSpace = true
     campaign := time.Now().UTC().Format("20060102T150405.000000000Z")
     imported, skipped := 0, 0
     reasons := map[string]int{}
-    var firstDatabaseError string
+    firstDBError := ""
     first := true
     phoneIdx, msgIdx, consIdx := 0, 1, 2
 
     for {
-        rec, err := reader.Read()
-        if err == io.EOF {
+        rec, readErr := reader.Read()
+        if readErr == io.EOF {
             break
         }
-        if err != nil {
+        if readErr != nil {
             skipped++
             reasons["CSV parse error"]++
             continue
         }
+        for i := range rec {
+            rec[i] = strings.TrimSpace(strings.TrimPrefix(rec[i], "\ufeff"))
+        }
         if first {
             first = false
-            phoneIdx = csvHeaderIndex(rec, "phone", "phone number", "number", "mobile", "mobile number")
-            msgIdx = csvHeaderIndex(rec, "message", "text", "body", "content")
-            consIdx = csvHeaderIndex(rec, "consent", "optin", "opted in", "opt-in")
-            if phoneIdx < 0 {
-                phoneIdx = 0
+            for i, raw := range rec {
+                h := normalizeCSVHeader(raw)
+                switch h {
+                case "phone", "phonenumber", "number", "mobilenumber", "mobile":
+                    phoneIdx = i
+                case "message", "text", "body", "content":
+                    msgIdx = i
+                case "consent", "optin", "optedin", "permission":
+                    consIdx = i
+                }
             }
-            if msgIdx < 0 {
-                msgIdx = 1
-            }
-            if consIdx < 0 {
-                consIdx = 2
-            }
-            joined := strings.ToLower(strings.Join(rec, ","))
-            hasHeaderWord := strings.Contains(joined, "phone") && (strings.Contains(joined, "message") || strings.Contains(joined, "text") || strings.Contains(joined, "body"))
-            if hasHeaderWord {
+            lower := strings.ToLower(strings.Join(rec, ","))
+            if strings.Contains(lower, "phone") && (strings.Contains(lower, "message") || strings.Contains(lower, "text")) {
                 continue
             }
         }
@@ -413,7 +394,7 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
             reasons["invalid phone number"]++
             continue
         }
-        msg := strings.TrimSpace(msgIdx < len(rec) ? rec[msgIdx] : "")
+        msg := strings.TrimSpace(rec[msgIdx])
         if msg == "" {
             skipped++
             reasons["empty message"]++
@@ -429,23 +410,20 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
             reasons["missing consent"]++
             continue
         }
-        consent := strings.ToLower(strings.TrimSpace(rec[consIdx]))
-        if consent != "yes" && consent != "true" && consent != "1" {
+        cons := strings.ToLower(strings.TrimSpace(rec[consIdx]))
+        if cons != "yes" && cons != "true" && cons != "1" {
             skipped++
             reasons["consent not granted"]++
             continue
         }
 
         key := bulkKey(campaign, phone, msg)
-        res, err := userDB.Exec(`
-            INSERT INTO public.bulk_messages(user_id,target,phone,message,consent,status,attempts,campaign_id,dedupe_key,created_at,updated_at)
-            VALUES(NULL,$1,$1,$2,$3,'queued',0,$4,$5,now(),now())
-            ON CONFLICT(dedupe_key) DO NOTHING`, phone, msg, consent, campaign, key)
-        if err != nil {
+        res, insertErr := userDB.Exec(`INSERT INTO public.bulk_messages(user_id,target,phone,message,consent,status,campaign_id,dedupe_key,updated_at) VALUES(NULL,$1,$1,$2,$3,'queued',$4,$5,now()) ON CONFLICT(dedupe_key) DO NOTHING`, phone, msg, cons, campaign, key)
+        if insertErr != nil {
             skipped++
             reasons["database insert failed"]++
-            if firstDatabaseError == "" {
-                firstDatabaseError = err.Error()
+            if firstDBError == "" {
+                firstDBError = fmt.Sprintf("%v", insertErr)
             }
             continue
         }
@@ -458,14 +436,22 @@ func bulkMessageImportHandler(w http.ResponseWriter, r *http.Request) {
         imported++
     }
 
-    out := map[string]any{"status": "success", "campaign_id": campaign, "imported": imported, "skipped": skipped, "skip_reasons": reasons}
-    if firstDatabaseError != "" {
-        out["first_database_error"] = firstDatabaseError
+    out := map[string]any{
+        "status":      "success",
+        "campaign_id": campaign,
+        "imported":    imported,
+        "skipped":     skipped,
+        "skip_reasons": reasons,
+    }
+    if firstDBError != "" {
+        out["first_database_error"] = firstDBError
     }
     bulkJSON(w, 200, out)
 }
 
-func init() { go bulkWorkerLoop() }
+func init() {
+    go bulkWorkerLoop()
+}
 
 func bulkAdminPageHandler(w http.ResponseWriter, r *http.Request) {
     if r.Method != http.MethodGet {
