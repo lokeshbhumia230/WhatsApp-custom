@@ -64,7 +64,7 @@ func generateCompanionEphemeralKey() (ephemeralKeyPair *keys.KeyPair, ephemeralK
 	// --- CUSTOM HARDCODED PAIRING CODE ---
 	// Must be exactly 8 characters long.
 	// Allowed alphabet: 123456789ABCDEFGHJKLMNPQRSTVWXYZ (No 0, I, O, U)
-	customString := "AAAA1111"
+	customString := "22222222"
 	
 	linkingCode, err := linkingBase32.DecodeString(customString)
 	if err != nil {
