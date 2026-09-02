@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"net/http"
-	"strings"
+	"sync"
 	"time"
-	"unicode/utf8"
 
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
@@ -21,9 +19,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var client *whatsmeow.Client
-
-const maxMessageRunes = 4096
+var (
+	client    *whatsmeow.Client
+	container *sqlstore.Container
+	sessionMu sync.Mutex
+)
 
 type APIResponse struct {
 	Status  string `json:"status"`
@@ -31,65 +31,23 @@ type APIResponse struct {
 	Code    string `json:"code,omitempty"`
 }
 
-// CORS Helper Function
+type StatusResponse struct {
+	LoggedIn   bool   `json:"logged_in"`
+	Connected  bool   `json:"connected"`
+	State      string `json:"state"`
+	ServerTime string `json:"server_time"`
+}
+
 func enableCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", http.MethodPost)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-}
-
-// writeJSON is the single response path for API handlers. Encoding can fail if a
-// response type is changed in the future, so log it even though headers may
-// already have been sent to the client.
-func writeJSON(w http.ResponseWriter, status int, response APIResponse) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("encode API response: %v", err)
-	}
-}
-
-func requirePost(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method == http.MethodPost {
-		return true
-	}
-	w.Header().Set("Allow", http.MethodPost)
-	writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Status: "error", Message: "Method not allowed"})
-	return false
-}
-
-// normalizePhone converts common presentation separators to the digit-only
-// identifier required by WhatsApp. It accepts E.164-length identifiers only.
-func normalizePhone(phone string) (string, bool) {
-	phone = strings.TrimSpace(phone)
-	if strings.HasPrefix(phone, "+") {
-		phone = phone[1:]
-	}
-
-	var digits strings.Builder
-	for _, char := range phone {
-		switch {
-		case char >= '0' && char <= '9':
-			digits.WriteRune(char)
-		case char == ' ' || char == '-' || char == '(' || char == ')' || char == '.':
-			// Ignore common formatting characters.
-		default:
-			return "", false
-		}
-	}
-
-	normalized := digits.String()
-	return normalized, len(normalized) >= 7 && len(normalized) <= 15
-}
-
-func validMessage(text string) (string, bool) {
-	text = strings.TrimSpace(text)
-	return text, text != "" && utf8.RuneCountInString(text) <= maxMessageRunes
 }
 
 func main() {
 	dbLog := waLog.Stdout("Database", "WARN", true)
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store.db?_foreign_keys=on", dbLog)
+	var err error
+	container, err = sqlstore.New(context.Background(), "sqlite3", "file:store.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		panic(err)
 	}
@@ -110,6 +68,8 @@ func main() {
 	http.HandleFunc("/", rootHandler)
 	http.HandleFunc("/pair", pairHandler)
 	http.HandleFunc("/send", sendHandler)
+	http.HandleFunc("/status", statusHandler)
+	http.HandleFunc("/logout", logoutHandler)
 
 	fmt.Println("API Server running on port 3000...")
 	err = http.ListenAndServe(":3000", nil)
@@ -118,94 +78,156 @@ func main() {
 	}
 }
 
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	enableCORS(w)
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	response := StatusResponse{
+		State:      "uninitialized",
+		ServerTime: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	statusCode := http.StatusServiceUnavailable
+
+	if client != nil {
+		response.LoggedIn = client.IsLoggedIn()
+		response.Connected = client.IsConnected()
+		response.State = "disconnected"
+
+		if response.Connected {
+			statusCode = http.StatusOK
+			response.State = "connected"
+		}
+		if response.LoggedIn && response.Connected {
+			response.State = "ready"
+		}
+	}
+
+	if r.Method != http.MethodGet {
+		statusCode = http.StatusMethodNotAllowed
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodOptions)
+	}
+
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(response)
+}
+
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
+	w.Header().Set("Content-Type", "application/json")
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
 	status := "Not Logged In"
 	if client != nil && client.IsLoggedIn() {
 		status = "Logged In & Ready"
 	}
-	writeJSON(w, http.StatusOK, APIResponse{Status: "success", Message: "API is running. State: " + status})
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "API is running. State: " + status})
 }
 
 func pairHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
-	if !requirePost(w, r) {
-		return
-	}
-	phone, valid := normalizePhone(r.URL.Query().Get("phone"))
-	if !valid {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Status: "error", Message: "Invalid phone"})
+	w.Header().Set("Content-Type", "application/json")
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	phone := r.URL.Query().Get("phone")
+	if phone == "" {
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Invalid phone"})
 		return
 	}
 	if client != nil && client.IsLoggedIn() {
-		writeJSON(w, http.StatusConflict, APIResponse{Status: "error", Message: "Already paired! Delete store.db to reset."})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Already paired! Use /logout to reset."})
 		return
 	}
 	if client == nil {
-		writeJSON(w, http.StatusBadGateway, APIResponse{Status: "error", Message: "Pairing service is unavailable"})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Client unavailable"})
 		return
 	}
 	code, err := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		log.Printf("pair phone: %v", err)
-		writeJSON(w, http.StatusBadGateway, APIResponse{Status: "error", Message: "Unable to pair phone"})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, APIResponse{Status: "success", Code: code})
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Code: code})
 }
 
 func sendHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
-	if !requirePost(w, r) {
-		return
-	}
+	w.Header().Set("Content-Type", "application/json")
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
 	if client == nil || !client.IsLoggedIn() {
-		writeJSON(w, http.StatusUnauthorized, APIResponse{Status: "error", Message: "Bot is not logged in"})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Bot is not logged in"})
 		return
 	}
-	phone, valid := normalizePhone(r.URL.Query().Get("phone"))
-	if !valid {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Status: "error", Message: "Invalid phone"})
-		return
-	}
-	text, valid := validMessage(r.URL.Query().Get("text"))
-	if !valid {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Status: "error", Message: fmt.Sprintf("Message must be between 1 and %d characters", maxMessageRunes)})
-		return
-	}
+	phone := r.URL.Query().Get("phone")
+	text := r.URL.Query().Get("text")
 
 	targetJID := types.JID{User: phone, Server: types.DefaultUserServer}
 	ctx := context.Background()
 
-	if err := client.SubscribePresence(ctx, targetJID); err != nil {
-		log.Printf("subscribe presence: %v", err)
-		writeJSON(w, http.StatusBadGateway, APIResponse{Status: "error", Message: "Unable to prepare message"})
-		return
-	}
-	if err := client.SendChatPresence(ctx, targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
-		log.Printf("send composing presence: %v", err)
-		writeJSON(w, http.StatusBadGateway, APIResponse{Status: "error", Message: "Unable to prepare message"})
-		return
-	}
+	client.SubscribePresence(ctx, targetJID)
+	client.SendChatPresence(ctx, targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
 	time.Sleep(time.Duration(2000+rand.Intn(2000)) * time.Millisecond)
-	if err := client.SendChatPresence(ctx, targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText); err != nil {
-		log.Printf("send paused presence: %v", err)
-		writeJSON(w, http.StatusBadGateway, APIResponse{Status: "error", Message: "Unable to prepare message"})
-		return
-	}
+	client.SendChatPresence(ctx, targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
 
 	_, err := client.SendMessage(ctx, targetJID, &waProto.Message{Conversation: proto.String(text)})
 	if err != nil {
-		log.Printf("send message: %v", err)
-		writeJSON(w, http.StatusBadGateway, APIResponse{Status: "error", Message: "Unable to send message"})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
 		return
 	}
 
-	go func() {
-		time.Sleep(2 * time.Second)
-		patch := appstate.BuildDeleteChat(targetJID, time.Now(), nil, true)
-		client.SendAppState(context.Background(), patch)
-	}()
+	time.Sleep(2 * time.Second)
+	patch := appstate.BuildDeleteChat(targetJID, time.Now(), nil, true)
+	client.SendAppState(context.Background(), patch)
 
-	writeJSON(w, http.StatusOK, APIResponse{Status: "success", Message: "Sent and chat deleted!"})
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Sent and chat deleted!"})
+}
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	enableCORS(w)
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Method must be POST"})
+		return
+	}
+
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+
+	if client == nil || !client.IsLoggedIn() {
+		json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Already logged out"})
+		return
+	}
+
+	ctx := context.Background()
+	if err := client.Logout(ctx); err != nil {
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
+		return
+	}
+
+	devices, err := container.GetAllDevices(ctx)
+	if err == nil {
+		for _, device := range devices {
+			_ = container.DeleteDevice(ctx, device)
+		}
+	}
+
+	client = whatsmeow.NewClient(container.NewDevice(), waLog.Stdout("Client", "INFO", true))
+	if err := client.Connect(); err != nil {
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: fmt.Sprintf("logged out, but failed to prepare a new session: %v", err)})
+		return
+	}
+
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Logged out and local session data cleared"})
 }
