@@ -23,9 +23,13 @@ func ensureBulkMessageTable() error {
   `ALTER TABLE public.bulk_messages ALTER COLUMN user_id DROP NOT NULL`,
   `CREATE INDEX IF NOT EXISTS bulk_messages_queue_idx ON public.bulk_messages(status,id)`,
   `CREATE INDEX IF NOT EXISTS bulk_messages_sender_idx ON public.bulk_messages(assigned_sender,status)`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_idx ON public.bulk_messages(dedupe_key) WHERE dedupe_key IS NOT NULL`,
  }
  for _,q:=range stmts { if _,e:=userDB.Exec(q); e!=nil{return e} }
+ // Older deployments may already contain duplicate non-null dedupe keys.
+ // Remove only duplicate queue rows, keeping the oldest row, so the unique
+ // partial index below can be created safely without losing the campaign data.
+ if _,e:=userDB.Exec(`DELETE FROM public.bulk_messages a USING public.bulk_messages b WHERE a.dedupe_key IS NOT NULL AND a.dedupe_key=b.dedupe_key AND a.id>b.id`); e!=nil{return e}
+ if _,e:=userDB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS bulk_messages_dedupe_idx ON public.bulk_messages(dedupe_key) WHERE dedupe_key IS NOT NULL`); e!=nil{return e}
  return nil
 }
 func bulkConnectedDevices() []string { manager.mu.RLock(); defer manager.mu.RUnlock(); ids:=[]string{}; for id,s:=range manager.sessions {if s!=nil&&s.client!=nil&&s.client.IsLoggedIn()&&s.client.IsConnected(){ids=append(ids,id)}}; sort.Strings(ids); return ids }
