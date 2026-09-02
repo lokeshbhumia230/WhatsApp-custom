@@ -65,12 +65,44 @@ func checkMessageSafety(userID, target string) error {
 	return err
 }
 
+// resolveRecipient verifies that WhatsApp can resolve the phone-number JID to
+// the recipient LID before consuming any ban-safety quota. SendMessage itself
+// performs the same LID resolution, but doing it here prevents invalid or
+// unresolvable recipients from incrementing the hourly/daily counters.
+func resolveRecipient(ctx context.Context, client *whatsmeow.Client, pn types.JID) error {
+	if pn.Server != types.DefaultUserServer || pn.User == "" {
+		return fmt.Errorf("invalid WhatsApp recipient: %s", pn)
+	}
+
+	if client.Store != nil && client.Store.LIDs != nil {
+		if lid, err := client.Store.LIDs.GetLIDForPN(ctx, pn); err == nil && !lid.IsEmpty() {
+			return nil
+		}
+	}
+
+	info, err := client.GetUserInfo(ctx, []types.JID{pn})
+	if err != nil {
+		return fmt.Errorf("failed to resolve WhatsApp recipient %s: %w", pn.User, err)
+	}
+	userInfo, ok := info[pn]
+	if !ok || userInfo.LID.IsEmpty() {
+		return fmt.Errorf("WhatsApp recipient %s could not be resolved (no LID found)", pn.User)
+	}
+	return nil
+}
+
 func safeSendMessage(userID string, client *whatsmeow.Client, targetJID types.JID, text string) error {
 	if client == nil || !client.IsLoggedIn() || !client.IsConnected() { return fmt.Errorf("WhatsApp is not connected") }
 	text = strings.TrimSpace(text)
 	if text == "" { return fmt.Errorf("message text is required") }
-	if err := checkMessageSafety(userID, targetJID.String()); err != nil { return err }
 	ctx := context.Background()
+
+	// Resolve the recipient first. This is important because whatsmeow sends
+	// normal WhatsApp DMs using the recipient's LID. If WhatsApp has no LID
+	// mapping, the send cannot succeed and should not consume safety quota.
+	if err := resolveRecipient(ctx, client, targetJID); err != nil { return err }
+	if err := checkMessageSafety(userID, targetJID.String()); err != nil { return err }
+
 	if getAdminSetting("send_typing", "true") == "true" {
 		_ = client.SubscribePresence(ctx, targetJID)
 		_ = client.SendChatPresence(ctx, targetJID, types.ChatPresenceComposing, types.ChatPresenceMediaText)
