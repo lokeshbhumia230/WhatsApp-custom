@@ -49,27 +49,20 @@ func adminPairLinksStatusHandler(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&token, &userID, &createdAt, &expiresAt, &used); err != nil {
 			continue
 		}
-
 		status := "pending"
 		if used {
 			status = "linked"
 		} else if now.After(expiresAt) {
 			status = "expired"
 		}
-
 		links = append(links, map[string]any{
-			"user_id":    userID,
-			"link":       base + "/connect/" + token,
+			"user_id": userID,
+			"link": base + "/connect/" + token,
 			"created_at": createdAt.UTC().Format(time.RFC3339),
 			"expires_at": expiresAt.UTC().Format(time.RFC3339),
-			"status":     status,
+			"status": status,
 		})
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "success", "links": links})
-}
-
-func init() {
-	http.HandleFunc("/admin/pair-links/status", adminHandler(adminPairLinksStatusHandler))
 }
