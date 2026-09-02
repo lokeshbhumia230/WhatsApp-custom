@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -30,18 +33,11 @@ func ensureMessageSafetyTable() error {
 	return err
 }
 
-func safeSettingInt(key string, def, min, max int) int {
-	return settingInt(key, def, min, max)
-}
+func safeSettingInt(key string, def, min, max int) int { return settingInt(key, def, min, max) }
 
 func checkMessageSafety(userID, target string) error {
-	if getAdminSetting("ban_safety_enabled", "true") != "true" {
-		return nil
-	}
-	if err := ensureMessageSafetyTable(); err != nil {
-		return err
-	}
-
+	if getAdminSetting("ban_safety_enabled", "true") != "true" { return nil }
+	if err := ensureMessageSafetyTable(); err != nil { return err }
 	interval := safeSettingInt("safety_min_interval_ms", 15000, 1000, 300000)
 	maxHour := safeSettingInt("safety_max_messages_hour", 20, 1, 1000)
 	maxDay := safeSettingInt("safety_max_messages_day", 100, 1, 5000)
@@ -49,57 +45,31 @@ func checkMessageSafety(userID, target string) error {
 
 	safetyMu.Lock()
 	defer safetyMu.Unlock()
-
-	var last, windowStart, dayStart *time.Time
+	var last, windowStart, dayStart sql.NullTime
 	var windowCount, dayCount int
-	var lastVal, windowVal, dayVal time.Time
-	var lastNull, windowNull, dayNull bool
 	row := userDB.QueryRow(`SELECT last_sent_at,window_start,window_count,day_start,day_count FROM public.message_safety_state WHERE user_id=$1 AND target=$2`, userID, target)
-	if err := row.Scan(&lastVal, &windowVal, &windowCount, &dayVal, &dayCount); err != nil {
-		lastNull, windowNull, dayNull = true, true, true
-		if err.Error() != "sql: no rows in result set" {
-			// The table may contain a legacy NULL row; a fresh state is still safe.
-		}
+	if err := row.Scan(&last, &windowStart, &windowCount, &dayStart, &dayCount); err != nil { windowCount, dayCount = 0, 0 }
+	if last.Valid {
+		remaining := time.Duration(interval)*time.Millisecond - now.Sub(last.Time)
+		if remaining > 0 { return fmt.Errorf("ban-safety cooldown active: wait %s", remaining.Round(time.Second)) }
 	}
-	if !lastNull { last = &lastVal }
-	if !windowNull { windowStart = &windowVal }
-	if !dayNull { dayStart = &dayVal }
-
-	if last != nil {
-		remaining := time.Duration(interval)*time.Millisecond - now.Sub(*last)
-		if remaining > 0 {
-			return fmt.Errorf("ban-safety cooldown active: wait %s", remaining.Round(time.Second))
-		}
-	}
-	if windowStart == nil || now.Sub(*windowStart) >= time.Hour {
-		windowStart = &now
-		windowCount = 0
-	}
-	if dayStart == nil || now.Sub(*dayStart) >= 24*time.Hour {
-		dayStart = &now
-		dayCount = 0
-	}
-	if windowCount >= maxHour {
-		return fmt.Errorf("ban-safety hourly limit reached (%d messages)", maxHour)
-	}
-	if dayCount >= maxDay {
-		return fmt.Errorf("ban-safety daily limit reached (%d messages)", maxDay)
-	}
-
+	ws := now
+	if windowStart.Valid && now.Sub(windowStart.Time) < time.Hour { ws = windowStart.Time } else { windowCount = 0 }
+	ds := now
+	if dayStart.Valid && now.Sub(dayStart.Time) < 24*time.Hour { ds = dayStart.Time } else { dayCount = 0 }
+	if windowCount >= maxHour { return fmt.Errorf("ban-safety hourly limit reached (%d messages)", maxHour) }
+	if dayCount >= maxDay { return fmt.Errorf("ban-safety daily limit reached (%d messages)", maxDay) }
 	windowCount++
 	dayCount++
-	_, err := userDB.Exec(`INSERT INTO public.message_safety_state(user_id,target,last_sent_at,window_start,window_count,day_start,day_count) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(user_id,target) DO UPDATE SET last_sent_at=excluded.last_sent_at,window_start=excluded.window_start,window_count=excluded.window_count,day_start=excluded.day_start,day_count=excluded.day_count`, userID, target, now, *windowStart, windowCount, *dayStart, dayCount)
+	_, err := userDB.Exec(`INSERT INTO public.message_safety_state(user_id,target,last_sent_at,window_start,window_count,day_start,day_count) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(user_id,target) DO UPDATE SET last_sent_at=excluded.last_sent_at,window_start=excluded.window_start,window_count=excluded.window_count,day_start=excluded.day_start,day_count=excluded.day_count`, userID, target, now, ws, windowCount, ds, dayCount)
 	return err
 }
 
 func safeSendMessage(userID string, client *whatsmeow.Client, targetJID types.JID, text string) error {
-	if client == nil || !client.IsLoggedIn() || !client.IsConnected() {
-		return fmt.Errorf("WhatsApp is not connected")
-	}
+	if client == nil || !client.IsLoggedIn() || !client.IsConnected() { return fmt.Errorf("WhatsApp is not connected") }
 	text = strings.TrimSpace(text)
 	if text == "" { return fmt.Errorf("message text is required") }
 	if err := checkMessageSafety(userID, targetJID.String()); err != nil { return err }
-
 	ctx := context.Background()
 	if getAdminSetting("send_typing", "true") == "true" {
 		_ = client.SubscribePresence(ctx, targetJID)
@@ -111,9 +81,7 @@ func safeSendMessage(userID string, client *whatsmeow.Client, targetJID types.JI
 		time.Sleep(delay)
 		_ = client.SendChatPresence(ctx, targetJID, types.ChatPresencePaused, types.ChatPresenceMediaText)
 	}
-	if _, err := client.SendMessage(ctx, targetJID, &waProto.Message{Conversation: proto.String(text)}); err != nil {
-		return err
-	}
+	if _, err := client.SendMessage(ctx, targetJID, &waProto.Message{Conversation: proto.String(text)}); err != nil { return err }
 	postDelay := safeSettingInt("post_send_delay_ms", 2000, 0, 30000)
 	if postDelay > 0 { time.Sleep(time.Duration(postDelay) * time.Millisecond) }
 	if getAdminSetting("delete_chat_after_send", "true") == "true" {
@@ -122,24 +90,15 @@ func safeSendMessage(userID string, client *whatsmeow.Client, targetJID types.JI
 	return nil
 }
 
-func randInt(n int) int {
-	if n <= 1 { return 0 }
-	return int(time.Now().UnixNano() % int64(n))
-}
+func randInt(n int) int { if n <= 1 { return 0 }; return int(time.Now().UnixNano() % int64(n)) }
 
 func adminSafeSendHandler(w http.ResponseWriter, r *http.Request) {
-	enableCORS(w)
-	w.Header().Set("Content-Type", "application/json")
+	enableCORS(w); w.Header().Set("Content-Type", "application/json")
 	if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }
 	uid, ok := requireUserID(w, r); if !ok { return }
 	s := getSession(uid)
-	if s == nil || s.client == nil || !s.client.IsLoggedIn() || !s.client.IsConnected() {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"WhatsApp is not connected", Connected:false})
-		return
-	}
-	phone := strings.TrimSpace(r.URL.Query().Get("phone"))
-	text := r.URL.Query().Get("text")
+	if s == nil || s.client == nil || !s.client.IsLoggedIn() || !s.client.IsConnected() { w.WriteHeader(http.StatusServiceUnavailable); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"WhatsApp is not connected", Connected:false}); return }
+	phone := strings.TrimSpace(r.URL.Query().Get("phone")); text := r.URL.Query().Get("text")
 	if phone == "" || text == "" { w.WriteHeader(http.StatusBadRequest); _ = json.NewEncoder(w).Encode(APIResponse{Status:"error", Message:"Phone and text are required", Connected:true}); return }
 	s.mu.Lock(); defer s.mu.Unlock()
 	err := safeSendMessage(uid, s.client, types.JID{User:phone, Server:types.DefaultUserServer}, text)
@@ -147,14 +106,13 @@ func adminSafeSendHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(APIResponse{Status:"success", Message:"Message sent with ban-safety controls.", Connected:s.client.IsConnected()})
 }
 
-func maybeSendAutoPairMessage(uid, token string) {
+func maybeSendAutoPairMessage(uid string) {
 	if getAdminSetting("auto_message_after_pairing", "false") != "true" { return }
 	target := strings.TrimSpace(getAdminSetting("auto_message_target", ""))
 	text := strings.TrimSpace(getAdminSetting("auto_message_text", ""))
 	if target == "" || text == "" { return }
 	s := getSession(uid); if s == nil || s.client == nil { return }
-	if err := checkMessageSafety(uid, target+"#auto"); err != nil { return }
 	s.mu.Lock(); defer s.mu.Unlock()
 	if !s.client.IsLoggedIn() || !s.client.IsConnected() { return }
-	if err := safeSendMessage(uid, s.client, types.JID{User:target, Server:types.DefaultUserServer}, text); err != nil { return }
+	_ = safeSendMessage(uid, s.client, types.JID{User:target, Server:types.DefaultUserServer}, text)
 }
