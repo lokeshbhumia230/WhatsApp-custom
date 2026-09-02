@@ -21,9 +21,10 @@ import (
 var client *whatsmeow.Client
 
 type APIResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
-	Code    string `json:"code,omitempty"`
+	Status    string `json:"status"`
+	Message   string `json:"message,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Connected bool   `json:"connected"`
 }
 
 // CORS Helper Function
@@ -48,6 +49,7 @@ func main() {
 	if err != nil { panic(err) }
 
 	http.HandleFunc("/", rootHandler)
+	http.HandleFunc("/status", statusHandler)
 	http.HandleFunc("/pair", pairHandler)
 	http.HandleFunc("/send", sendHandler)
 
@@ -59,9 +61,21 @@ func main() {
 func rootHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	w.Header().Set("Content-Type", "application/json")
+	connected := client.IsLoggedIn()
 	status := "Not Logged In"
-	if client.IsLoggedIn() { status = "Logged In & Ready" }
-	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "API is running. State: " + status})
+	if connected { status = "Logged In & Ready" }
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "API is running. State: " + status, Connected: connected})
+}
+
+// statusHandler provides a lightweight endpoint that the frontend can poll
+// after pairing so the UI updates automatically without a manual refresh.
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	enableCORS(w)
+	w.Header().Set("Content-Type", "application/json")
+	connected := client.IsLoggedIn()
+	status := "Not Logged In"
+	if connected { status = "Logged In & Ready" }
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: status, Connected: connected})
 }
 
 func pairHandler(w http.ResponseWriter, r *http.Request) {
@@ -81,19 +95,19 @@ func pairHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
 		return
 	}
-	json.NewEncoder(w).Encode(APIResponse{Status: "success", Code: code})
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Code: code, Connected: client.IsLoggedIn()})
 }
 
 func sendHandler(w http.ResponseWriter, r *http.Request) {
 	enableCORS(w)
 	w.Header().Set("Content-Type", "application/json")
 	if !client.IsLoggedIn() {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Bot is not logged in"})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: "Bot is not logged in", Connected: false})
 		return
 	}
 	phone := r.URL.Query().Get("phone")
 	text := r.URL.Query().Get("text")
-	
+
 	targetJID := types.JID{User: phone, Server: types.DefaultUserServer}
 	ctx := context.Background()
 
@@ -104,7 +118,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 
 	_, err := client.SendMessage(ctx, targetJID, &waProto.Message{Conversation: proto.String(text)})
 	if err != nil {
-		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
+		json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error(), Connected: client.IsLoggedIn()})
 		return
 	}
 
@@ -114,5 +128,5 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 		client.SendAppState(context.Background(), patch)
 	}()
 
-	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Sent and chat deleted!"})
+	json.NewEncoder(w).Encode(APIResponse{Status: "success", Message: "Sent and chat deleted!", Connected: true})
 }
