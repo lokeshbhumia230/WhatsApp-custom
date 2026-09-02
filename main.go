@@ -53,14 +53,27 @@ type StatusResponse struct {
 	ServerTime string `json:"server_time"`
 }
 
+type DeviceInfo struct {
+	UserID    string `json:"user_id"`
+	Phone     string `json:"phone,omitempty"`
+	Connected bool   `json:"connected"`
+	LoggedIn  bool   `json:"logged_in"`
+	State     string `json:"state"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
 func enableCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-User-ID, X-Admin-Token")
 }
 
 func getUserID(r *http.Request) string {
-	return strings.TrimSpace(r.URL.Query().Get("user_id"))
+	id := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	if id == "" {
+		id = strings.TrimSpace(r.Header.Get("X-User-ID"))
+	}
+	return id
 }
 
 func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -160,7 +173,9 @@ func loadSessions(ctx context.Context) error {
 		if err := client.Connect(); err != nil {
 			continue
 		}
+		manager.mu.Lock()
 		manager.sessions[uid] = &Session{client: client}
+		manager.mu.Unlock()
 	}
 	return rows.Err()
 }
@@ -187,15 +202,25 @@ func main() {
 	}
 
 	http.HandleFunc("/", rootHandler)
+	http.HandleFunc("/pairing", pairingPageHandler)
 	http.HandleFunc("/pair", pairHandler)
 	http.HandleFunc("/send", sendHandler)
 	http.HandleFunc("/status", statusHandler)
+	http.HandleFunc("/devices", devicesHandler)
 	http.HandleFunc("/logout", logoutHandler)
 
 	fmt.Println("Multi-user WhatsApp API Server running on port 3000...")
 	if err = http.ListenAndServe(":3000", nil); err != nil {
 		panic(err)
 	}
+}
+
+func pairingPageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	http.ServeFile(w, r, "pairing.html")
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +268,58 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+func devicesHandler(w http.ResponseWriter, r *http.Request) {
+	enableCORS(w)
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	rows, err := userDB.Query(`SELECT user_id,jid,updated_at FROM user_sessions ORDER BY updated_at DESC`)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(APIResponse{Status: "error", Message: err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	devices := make([]DeviceInfo, 0)
+	for rows.Next() {
+		var uid, jidString string
+		var updated time.Time
+		if err := rows.Scan(&uid, &jidString, &updated); err != nil {
+			continue
+		}
+		info := DeviceInfo{UserID: uid, UpdatedAt: updated.UTC().Format(time.RFC3339)}
+		if jid, err := types.ParseJID(jidString); err == nil {
+			info.Phone = jid.User
+		}
+		if s := getSession(uid); s != nil && s.client != nil {
+			info.LoggedIn = s.client.IsLoggedIn()
+			info.Connected = s.client.IsConnected()
+			switch {
+			case info.LoggedIn && info.Connected:
+				info.State = "ready"
+			case info.Connected:
+				info.State = "connected"
+			case info.LoggedIn:
+				info.State = "logged_in"
+			default:
+				info.State = "disconnected"
+			}
+		} else {
+			info.State = "offline"
+		}
+		devices = append(devices, info)
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "success", "devices": devices})
 }
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
