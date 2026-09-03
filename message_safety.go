@@ -37,7 +37,6 @@ func checkMessageSafety(userID string)error{
  return nil
 }
 
-// recordMessageSafety records a message only after WhatsApp confirms SendMessage succeeded.
 func recordMessageSafety(userID string) error {
  if getAdminSetting("ban_safety_enabled","true")!="true" { return nil }
  if err:=ensureMessageSafetyTable();err!=nil{return err}
@@ -63,9 +62,6 @@ func recipientRateLimited(userID string) bool {
 }
 func setRecipientRateLimit(userID string,d time.Duration){recipientRateLimitMu.Lock();recipientRateLimitUntil[userID]=time.Now().Add(d);recipientRateLimitMu.Unlock()}
 
-// whatsmeow's SendMessage already performs the PN->LID lookup when the LID is not cached.
-// First use the local LID cache. If the full user-info lookup still returns no LID,
-// retry the resolution through IsOnWhatsApp's interactive LID addressing query.
 func resolveCachedRecipient(client *whatsmeow.Client,pn types.JID)(types.JID,bool){
  if client==nil||client.Store==nil||client.Store.LIDs==nil{return types.JID{},false}
  lid,err:=client.Store.LIDs.GetLIDForPN(context.Background(),pn)
@@ -92,13 +88,16 @@ func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,
  if client==nil||!client.IsLoggedIn()||!client.IsConnected(){recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("WhatsApp is not connected"));return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("message text is required"));return fmt.Errorf("message text is required")};if targetJID.Server!=types.DefaultUserServer||strings.TrimSpace(targetJID.User)==""{recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("invalid WhatsApp recipient: %s",targetJID));return fmt.Errorf("invalid WhatsApp recipient: %s",targetJID)}
  recordSendTelemetry(userID,targetJID.User,"attempt",nil)
  if recipientRateLimited(userID){err:=fmt.Errorf("WhatsApp recipient lookup temporarily rate-limited (429); waiting before retry");recordSendTelemetry(userID,targetJID.User,"rate_limited",err);return err}
- if err:=checkMessageSafety(userID);err!=nil{recordSendTelemetry(userID,targetJID.User,"safety_blocked",err);return err};ctx,cancel:=context.WithTimeout(context.Background(),45*time.Second);defer cancel()
+ if err:=checkMessageSafety(userID);err!=nil{recordSendTelemetry(userID,targetJID.User,"safety_blocked",err);return err}
+ // Query WhatsApp's own account-level outreach controls before attempting a new direct message.
+ if err:=checkAccountHealthForSend(userID,client);err!=nil{recordSendTelemetry(userID,targetJID.User,"send_paused_by_account_health",err);return err}
+ ctx,cancel:=context.WithTimeout(context.Background(),45*time.Second);defer cancel()
  resolved,cached,resolveErr:=resolveRecipientWithLIDFallback(ctx,client,targetJID)
  if resolveErr!=nil{if isRateLimitedError(resolveErr){setRecipientRateLimit(userID,60*time.Second);recordSendTelemetry(userID,targetJID.User,"lid_lookup_rate_limited",resolveErr);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};recordSendTelemetry(userID,targetJID.User,"lid_lookup_failed",resolveErr);return fmt.Errorf("WhatsApp recipient lookup failed: %w",resolveErr)}
  if !cached&&!resolved.IsEmpty(){cached=true}
  if cached{recordSendTelemetry(userID,targetJID.User,"lid_resolved",nil)}else{recordSendTelemetry(userID,targetJID.User,"lid_not_resolved",nil)}
  if getAdminSetting("send_typing","true")=="true"&&cached{_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);minMS:=safeSettingInt("typing_min_ms",2000,0,30000);maxMS:=safeSettingInt("typing_max_ms",4000,minMS,60000);delay:=time.Duration(minMS)*time.Millisecond;if maxMS>minMS{delay+=time.Duration(randInt(maxMS-minMS+1))*time.Millisecond};time.Sleep(delay);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
- sendTo:=targetJID;if cached{sendTo=resolved};if _,err:=client.SendMessage(ctx,sendTo,&waProto.Message{Conversation:proto.String(text)});err!=nil{if isRateLimitedError(err){setRecipientRateLimit(userID,60*time.Second);recordSendTelemetry(userID,targetJID.User,"send_rate_limited",err);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};if isNoLIDError(err){recordSendTelemetry(userID,targetJID.User,"send_no_lid",err);return fmt.Errorf("WhatsApp recipient has no LID; recipient lookup failed after standard and interactive lookup")};if errorsIsContextDeadline(err){recordSendTelemetry(userID,targetJID.User,"send_timeout",err);return fmt.Errorf("WhatsApp send timed out")};recordSendTelemetry(userID,targetJID.User,"send_failed",err);return err}
+ sendTo:=targetJID;if cached{sendTo=resolved};if _,err:=client.SendMessage(ctx,sendTo,&waProto.Message{Conversation:proto.String(text)});err!=nil{if isRateLimitedError(err){setRecipientRateLimit(userID,60*time.Second);recordSendTelemetry(userID,targetJID.User,"send_rate_limited",err);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};if isNoLIDError(err){recordSendTelemetry(userID,targetJID.User,"send_no_lid",err);return fmt.Errorf("WhatsApp recipient has no LID; recipient lookup failed after standard and interactive lookup")};if is463Error(err){markAccountTimelock(userID,client,err);recordSendTelemetry(userID,targetJID.User,"timelock_detected",err);return fmt.Errorf("WhatsApp reachout timelock detected (463); account outreach has been paused")};if errorsIsContextDeadline(err){recordSendTelemetry(userID,targetJID.User,"send_timeout",err);return fmt.Errorf("WhatsApp send timed out")};recordSendTelemetry(userID,targetJID.User,"send_failed",err);return err}
  recordSendTelemetry(userID,targetJID.User,"send_success",nil)
  if err:=recordMessageSafety(userID);err!=nil{fmt.Printf("message safety state update failed after successful send for %s: %v\n",userID,err)}
  postDelay:=safeSettingInt("post_send_delay_ms",2000,0,30000);if postDelay>0{time.Sleep(time.Duration(postDelay)*time.Millisecond)};if getAdminSetting("delete_chat_after_send","true")=="true"&&cached{if err:=client.SendAppState(ctx,appstate.BuildDeleteChat(resolved,time.Now(),nil,true));err!=nil{fmt.Printf("chat cleanup failed after successful send: %v\n",err)}};return nil
