@@ -7,6 +7,7 @@ import (
  "fmt"
  "net/http"
  "strings"
+ "sync"
  "time"
  "go.mau.fi/whatsmeow"
  "go.mau.fi/whatsmeow/appstate"
@@ -14,6 +15,15 @@ import (
  waProto "go.mau.fi/whatsmeow/proto/waE2E"
  "google.golang.org/protobuf/proto"
 )
+
+type recipientResolution struct {
+ jid types.JID
+ expiresAt time.Time
+}
+
+var recipientResolutionMu sync.Mutex
+var recipientResolutionCache = map[string]recipientResolution{}
+var recipientNegativeCache = map[string]time.Time{}
 
 func ensureMessageSafetyTable() error {
  _,err:=userDB.Exec(`CREATE TABLE IF NOT EXISTS public.message_safety_state(user_id TEXT NOT NULL,target TEXT NOT NULL,last_sent_at TIMESTAMPTZ,window_start TIMESTAMPTZ,window_count INTEGER NOT NULL DEFAULT 0,day_start TIMESTAMPTZ,day_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(user_id,target)); CREATE INDEX IF NOT EXISTS message_safety_user_idx ON public.message_safety_state(user_id)`)
@@ -32,10 +42,36 @@ func checkMessageSafety(userID string)error{
  if err==sql.ErrNoRows{_,err=tx.Exec(`INSERT INTO public.message_safety_state(user_id,target,last_sent_at,window_start,window_count,day_start,day_count) VALUES($1,'__ACCOUNT__',$2,$3,1,$4,1)`,userID,now,ws.Time,ds.Time)}else{_,err=tx.Exec(`UPDATE public.message_safety_state SET last_sent_at=$2,window_start=$3,window_count=$4,day_start=$5,day_count=$6 WHERE user_id=$1 AND target='__ACCOUNT__'`,userID,now,ws.Time,hc+1,ds.Time,dc+1)};if err!=nil{return err};return tx.Commit()
 }
 
-func resolveRecipient(ctx context.Context,client *whatsmeow.Client,pn types.JID)(types.JID,error){if client==nil||client.Store==nil{return types.JID{},fmt.Errorf("WhatsApp recipient resolver unavailable")};if pn.Server!=types.DefaultUserServer||strings.TrimSpace(pn.User)==""{return types.JID{},fmt.Errorf("invalid WhatsApp recipient: %s",pn)};if client.Store.LIDs!=nil{if lid,err:=client.Store.LIDs.GetLIDForPN(ctx,pn);err==nil&&!lid.IsEmpty(){return lid,nil}};info,err:=client.GetUserInfo(ctx,[]types.JID{pn});if err!=nil{return types.JID{},fmt.Errorf("failed to resolve WhatsApp recipient %s: %w",pn.User,err)};ui,ok:=info[pn];if !ok||ui.LID.IsEmpty(){return types.JID{},fmt.Errorf("WhatsApp recipient %s could not be resolved (no LID found)",pn.User)};return ui.LID,nil}
+func isRateLimitedError(err error) bool {
+ if err==nil{return false}
+ s:=strings.ToLower(err.Error())
+ return strings.Contains(s,"status 429")||strings.Contains(s,"429")||strings.Contains(s,"rate-overlimit")||strings.Contains(s,"rate limit")
+}
+
+func recipientCacheKey(userID string,pn types.JID) string{return userID+"|"+pn.String()}
+
+func resolveRecipient(ctx context.Context,userID string,client *whatsmeow.Client,pn types.JID)(types.JID,error){
+ if client==nil||client.Store==nil{return types.JID{},fmt.Errorf("WhatsApp recipient resolver unavailable")}
+ if pn.Server!=types.DefaultUserServer||strings.TrimSpace(pn.User)==""{return types.JID{},fmt.Errorf("invalid WhatsApp recipient: %s",pn)}
+ key:=recipientCacheKey(userID,pn);now:=time.Now()
+ recipientResolutionMu.Lock()
+ if cached,ok:=recipientResolutionCache[key];ok&&now.Before(cached.expiresAt){recipientResolutionMu.Unlock();return cached.jid,nil}
+ if until,ok:=recipientNegativeCache[key];ok&&now.Before(until){recipientResolutionMu.Unlock();return types.JID{},fmt.Errorf("WhatsApp recipient %s could not be resolved (no LID found)",pn.User)}
+ delete(recipientResolutionCache,key);delete(recipientNegativeCache,key);recipientResolutionMu.Unlock()
+ if client.Store.LIDs!=nil{if lid,err:=client.Store.LIDs.GetLIDForPN(ctx,pn);err==nil&&!lid.IsEmpty(){recipientResolutionMu.Lock();recipientResolutionCache[key]=recipientResolution{jid:lid,expiresAt:now.Add(24*time.Hour)};recipientResolutionMu.Unlock();return lid,nil}}
+ info,err:=client.GetUserInfo(ctx,[]types.JID{pn})
+ if err!=nil{
+  if isRateLimitedError(err){return types.JID{},fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")}
+  return types.JID{},fmt.Errorf("failed to resolve WhatsApp recipient %s: %w",pn.User,err)
+ }
+ ui,ok:=info[pn]
+ if !ok||ui.LID.IsEmpty(){recipientResolutionMu.Lock();recipientNegativeCache[key]=now.Add(10*time.Minute);recipientResolutionMu.Unlock();return types.JID{},fmt.Errorf("WhatsApp recipient %s could not be resolved (no LID found)",pn.User)}
+ recipientResolutionMu.Lock();recipientResolutionCache[key]=recipientResolution{jid:ui.LID,expiresAt:now.Add(24*time.Hour)};recipientResolutionMu.Unlock()
+ return ui.LID,nil
+}
 
 func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,text string)error{
- if client==nil||!client.IsLoggedIn()||!client.IsConnected(){return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{return fmt.Errorf("message text is required")};ctx:=context.Background();resolved,err:=resolveRecipient(ctx,client,targetJID);if err!=nil{return err};if err=checkMessageSafety(userID);err!=nil{return err}
+ if client==nil||!client.IsLoggedIn()||!client.IsConnected(){return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{return fmt.Errorf("message text is required")};ctx:=context.Background();resolved,err:=resolveRecipient(ctx,userID,client,targetJID);if err!=nil{return err};if err=checkMessageSafety(userID);err!=nil{return err}
  if getAdminSetting("send_typing","true")=="true"{_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);minMS:=safeSettingInt("typing_min_ms",2000,0,30000);maxMS:=safeSettingInt("typing_max_ms",4000,minMS,60000);delay:=time.Duration(minMS)*time.Millisecond;if maxMS>minMS{delay+=time.Duration(randInt(maxMS-minMS+1))*time.Millisecond};time.Sleep(delay);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
  if _,err=client.SendMessage(ctx,resolved,&waProto.Message{Conversation:proto.String(text)});err!=nil{return err};postDelay:=safeSettingInt("post_send_delay_ms",2000,0,30000);if postDelay>0{time.Sleep(time.Duration(postDelay)*time.Millisecond)};if getAdminSetting("delete_chat_after_send","true")=="true"{if err=client.SendAppState(ctx,appstate.BuildDeleteChat(resolved,time.Now(),nil,true));err!=nil{fmt.Printf("chat cleanup failed after successful send: %v\n",err)}};return nil
 }
