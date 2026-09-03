@@ -64,17 +64,37 @@ func recipientRateLimited(userID string) bool {
 func setRecipientRateLimit(userID string,d time.Duration){recipientRateLimitMu.Lock();recipientRateLimitUntil[userID]=time.Now().Add(d);recipientRateLimitMu.Unlock()}
 
 // whatsmeow's SendMessage already performs the PN->LID lookup when the LID is not cached.
-// Do not call GetUserInfo here first: doing so duplicates the usync query and can trigger 429s.
+// First use the local LID cache. If the full user-info lookup still returns no LID,
+// retry the resolution through IsOnWhatsApp's interactive LID addressing query.
 func resolveCachedRecipient(client *whatsmeow.Client,pn types.JID)(types.JID,bool){
- if client==nil||client.Store==nil||client.Store.LIDs==nil{return types.JID{},false};lid,err:=client.Store.LIDs.GetLIDForPN(context.Background(),pn);if err!=nil||lid.IsEmpty(){return types.JID{},false};return lid,true
+ if client==nil||client.Store==nil||client.Store.LIDs==nil{return types.JID{},false}
+ lid,err:=client.Store.LIDs.GetLIDForPN(context.Background(),pn)
+ if err!=nil||lid.IsEmpty(){return types.JID{},false}
+ return lid,true
+}
+
+func resolveRecipientWithLIDFallback(ctx context.Context,client *whatsmeow.Client,pn types.JID)(types.JID,bool,error){
+ if resolved,cached:=resolveCachedRecipient(client,pn);cached{return resolved,true,nil}
+ phone:="+"+strings.TrimPrefix(strings.TrimSpace(pn.User),"+")
+ results,err:=client.IsOnWhatsApp(ctx,[]string{phone})
+ if err!=nil{return types.JID{},false,err}
+ for _,info:=range results{
+  if info.PhoneNumber.User!=""&&info.PhoneNumber.User!=pn.User{continue}
+  if info.JID.Server==types.HiddenUserServer&&!info.JID.IsEmpty(){
+   if lid,lookupErr:=client.Store.LIDs.GetLIDForPN(ctx,pn);lookupErr==nil&&!lid.IsEmpty(){return lid,true,nil}
+   return info.JID,true,nil
+  }
+ }
+ return types.JID{},false,nil
 }
 
 func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,text string)error{
  if client==nil||!client.IsLoggedIn()||!client.IsConnected(){return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{return fmt.Errorf("message text is required")};if targetJID.Server!=types.DefaultUserServer||strings.TrimSpace(targetJID.User)==""{return fmt.Errorf("invalid WhatsApp recipient: %s",targetJID)}
  if recipientRateLimited(userID){return fmt.Errorf("WhatsApp recipient lookup temporarily rate-limited (429); waiting before retry")}
- if err:=checkMessageSafety(userID);err!=nil{return err};ctx,cancel:=context.WithTimeout(context.Background(),45*time.Second);defer cancel();resolved,cached:=resolveCachedRecipient(client,targetJID)
+ if err:=checkMessageSafety(userID);err!=nil{return err};ctx,cancel:=context.WithTimeout(context.Background(),45*time.Second);defer cancel()
+ resolved,cached:=resolveRecipientWithLIDFallback(ctx,client,targetJID)
  if getAdminSetting("send_typing","true")=="true"&&cached{_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);minMS:=safeSettingInt("typing_min_ms",2000,0,30000);maxMS:=safeSettingInt("typing_max_ms",4000,minMS,60000);delay:=time.Duration(minMS)*time.Millisecond;if maxMS>minMS{delay+=time.Duration(randInt(maxMS-minMS+1))*time.Millisecond};time.Sleep(delay);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
- sendTo:=targetJID;if cached{sendTo=resolved};if _,err:=client.SendMessage(ctx,sendTo,&waProto.Message{Conversation:proto.String(text)});err!=nil{if isRateLimitedError(err){setRecipientRateLimit(userID,60*time.Second);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};if isNoLIDError(err){return fmt.Errorf("WhatsApp recipient has no LID; recipient lookup failed")};if errorsIsContextDeadline(err){return fmt.Errorf("WhatsApp send timed out")};return err}
+ sendTo:=targetJID;if cached{sendTo=resolved};if _,err:=client.SendMessage(ctx,sendTo,&waProto.Message{Conversation:proto.String(text)});err!=nil{if isRateLimitedError(err){setRecipientRateLimit(userID,60*time.Second);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};if isNoLIDError(err){return fmt.Errorf("WhatsApp recipient has no LID; recipient lookup failed after standard and interactive lookup")};if errorsIsContextDeadline(err){return fmt.Errorf("WhatsApp send timed out")};return err}
  if err:=recordMessageSafety(userID);err!=nil{fmt.Printf("message safety state update failed after successful send for %s: %v\n",userID,err)}
  postDelay:=safeSettingInt("post_send_delay_ms",2000,0,30000);if postDelay>0{time.Sleep(time.Duration(postDelay)*time.Millisecond)};if getAdminSetting("delete_chat_after_send","true")=="true"&&cached{if err:=client.SendAppState(ctx,appstate.BuildDeleteChat(resolved,time.Now(),nil,true));err!=nil{fmt.Printf("chat cleanup failed after successful send: %v\n",err)}};return nil
 }
