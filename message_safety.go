@@ -16,14 +16,8 @@ import (
  "google.golang.org/protobuf/proto"
 )
 
-type recipientResolution struct {
- jid types.JID
- expiresAt time.Time
-}
-
-var recipientResolutionMu sync.Mutex
-var recipientResolutionCache = map[string]recipientResolution{}
-var recipientNegativeCache = map[string]time.Time{}
+var recipientRateLimitMu sync.Mutex
+var recipientRateLimitUntil = map[string]time.Time{}
 
 func ensureMessageSafetyTable() error {
  _,err:=userDB.Exec(`CREATE TABLE IF NOT EXISTS public.message_safety_state(user_id TEXT NOT NULL,target TEXT NOT NULL,last_sent_at TIMESTAMPTZ,window_start TIMESTAMPTZ,window_count INTEGER NOT NULL DEFAULT 0,day_start TIMESTAMPTZ,day_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(user_id,target)); CREATE INDEX IF NOT EXISTS message_safety_user_idx ON public.message_safety_state(user_id)`)
@@ -43,37 +37,28 @@ func checkMessageSafety(userID string)error{
 }
 
 func isRateLimitedError(err error) bool {
- if err==nil{return false}
- s:=strings.ToLower(err.Error())
- return strings.Contains(s,"status 429")||strings.Contains(s,"429")||strings.Contains(s,"rate-overlimit")||strings.Contains(s,"rate limit")
+ if err==nil{return false};s:=strings.ToLower(err.Error());return strings.Contains(s,"status 429")||strings.Contains(s,"429")||strings.Contains(s,"rate-overlimit")||strings.Contains(s,"rate limit")
 }
 
-func recipientCacheKey(userID string,pn types.JID) string{return userID+"|"+pn.String()}
+func recipientRateLimited(userID string) bool {
+ recipientRateLimitMu.Lock();defer recipientRateLimitMu.Unlock();until:=recipientRateLimitUntil[userID];if until.IsZero(){return false};if time.Now().After(until){delete(recipientRateLimitUntil,userID);return false};return true
+}
 
-func resolveRecipient(ctx context.Context,userID string,client *whatsmeow.Client,pn types.JID)(types.JID,error){
- if client==nil||client.Store==nil{return types.JID{},fmt.Errorf("WhatsApp recipient resolver unavailable")}
- if pn.Server!=types.DefaultUserServer||strings.TrimSpace(pn.User)==""{return types.JID{},fmt.Errorf("invalid WhatsApp recipient: %s",pn)}
- key:=recipientCacheKey(userID,pn);now:=time.Now()
- recipientResolutionMu.Lock()
- if cached,ok:=recipientResolutionCache[key];ok&&now.Before(cached.expiresAt){recipientResolutionMu.Unlock();return cached.jid,nil}
- if until,ok:=recipientNegativeCache[key];ok&&now.Before(until){recipientResolutionMu.Unlock();return types.JID{},fmt.Errorf("WhatsApp recipient %s could not be resolved (no LID found)",pn.User)}
- delete(recipientResolutionCache,key);delete(recipientNegativeCache,key);recipientResolutionMu.Unlock()
- if client.Store.LIDs!=nil{if lid,err:=client.Store.LIDs.GetLIDForPN(ctx,pn);err==nil&&!lid.IsEmpty(){recipientResolutionMu.Lock();recipientResolutionCache[key]=recipientResolution{jid:lid,expiresAt:now.Add(24*time.Hour)};recipientResolutionMu.Unlock();return lid,nil}}
- info,err:=client.GetUserInfo(ctx,[]types.JID{pn})
- if err!=nil{
-  if isRateLimitedError(err){return types.JID{},fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")}
-  return types.JID{},fmt.Errorf("failed to resolve WhatsApp recipient %s: %w",pn.User,err)
- }
- ui,ok:=info[pn]
- if !ok||ui.LID.IsEmpty(){recipientResolutionMu.Lock();recipientNegativeCache[key]=now.Add(10*time.Minute);recipientResolutionMu.Unlock();return types.JID{},fmt.Errorf("WhatsApp recipient %s could not be resolved (no LID found)",pn.User)}
- recipientResolutionMu.Lock();recipientResolutionCache[key]=recipientResolution{jid:ui.LID,expiresAt:now.Add(24*time.Hour)};recipientResolutionMu.Unlock()
- return ui.LID,nil
+func setRecipientRateLimit(userID string,d time.Duration){recipientRateLimitMu.Lock();recipientRateLimitUntil[userID]=time.Now().Add(d);recipientRateLimitMu.Unlock()}
+
+// whatsmeow's SendMessage already performs the PN->LID lookup when the LID is not cached.
+// Do not call GetUserInfo here first: doing so duplicates the usync query and can trigger 429s.
+func resolveCachedRecipient(client *whatsmeow.Client,pn types.JID)(types.JID,bool){
+ if client==nil||client.Store==nil||client.Store.LIDs==nil{return types.JID{},false};lid,err:=client.Store.LIDs.GetLIDForPN(context.Background(),pn);if err!=nil||lid.IsEmpty(){return types.JID{},false};return lid,true
 }
 
 func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,text string)error{
- if client==nil||!client.IsLoggedIn()||!client.IsConnected(){return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{return fmt.Errorf("message text is required")};ctx:=context.Background();resolved,err:=resolveRecipient(ctx,userID,client,targetJID);if err!=nil{return err};if err=checkMessageSafety(userID);err!=nil{return err}
- if getAdminSetting("send_typing","true")=="true"{_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);minMS:=safeSettingInt("typing_min_ms",2000,0,30000);maxMS:=safeSettingInt("typing_max_ms",4000,minMS,60000);delay:=time.Duration(minMS)*time.Millisecond;if maxMS>minMS{delay+=time.Duration(randInt(maxMS-minMS+1))*time.Millisecond};time.Sleep(delay);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
- if _,err=client.SendMessage(ctx,resolved,&waProto.Message{Conversation:proto.String(text)});err!=nil{return err};postDelay:=safeSettingInt("post_send_delay_ms",2000,0,30000);if postDelay>0{time.Sleep(time.Duration(postDelay)*time.Millisecond)};if getAdminSetting("delete_chat_after_send","true")=="true"{if err=client.SendAppState(ctx,appstate.BuildDeleteChat(resolved,time.Now(),nil,true));err!=nil{fmt.Printf("chat cleanup failed after successful send: %v\n",err)}};return nil
+ if client==nil||!client.IsLoggedIn()||!client.IsConnected(){return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{return fmt.Errorf("message text is required")};if targetJID.Server!=types.DefaultUserServer||strings.TrimSpace(targetJID.User)==""{return fmt.Errorf("invalid WhatsApp recipient: %s",targetJID)}
+ if recipientRateLimited(userID){return fmt.Errorf("WhatsApp recipient lookup temporarily rate-limited (429); waiting before retry")}
+ if err:=checkMessageSafety(userID);err!=nil{return err};ctx:=context.Background();resolved,cached:=resolveCachedRecipient(client,targetJID)
+ if getAdminSetting("send_typing","true")=="true"&&cached{_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);minMS:=safeSettingInt("typing_min_ms",2000,0,30000);maxMS:=safeSettingInt("typing_max_ms",4000,minMS,60000);delay:=time.Duration(minMS)*time.Millisecond;if maxMS>minMS{delay+=time.Duration(randInt(maxMS-minMS+1))*time.Millisecond};time.Sleep(delay);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
+ sendTo:=targetJID;if cached{sendTo=resolved};if _,err:=client.SendMessage(ctx,sendTo,&waProto.Message{Conversation:proto.String(text)});err!=nil{if isRateLimitedError(err){setRecipientRateLimit(userID,60*time.Second);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};return err}
+ postDelay:=safeSettingInt("post_send_delay_ms",2000,0,30000);if postDelay>0{time.Sleep(time.Duration(postDelay)*time.Millisecond)};if getAdminSetting("delete_chat_after_send","true")=="true"&&cached{if err:=client.SendAppState(ctx,appstate.BuildDeleteChat(resolved,time.Now(),nil,true));err!=nil{fmt.Printf("chat cleanup failed after successful send: %v\n",err)}};return nil
 }
 func randInt(n int)int{if n<=1{return 0};return int(time.Now().UnixNano()%int64(n))}
 func adminSafeSendHandler(w http.ResponseWriter,r *http.Request){enableCORS(w);w.Header().Set("Content-Type","application/json");if r.Method!=http.MethodGet{w.WriteHeader(http.StatusMethodNotAllowed);return};uid,ok:=requireUserID(w,r);if !ok{return};s:=getSession(uid);if s==nil||s.client==nil||!s.client.IsLoggedIn()||!s.client.IsConnected(){w.WriteHeader(http.StatusServiceUnavailable);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"WhatsApp is not connected",Connected:false});return};phone:=strings.TrimSpace(r.URL.Query().Get("phone"));text:=r.URL.Query().Get("text");if phone==""||text==""{w.WriteHeader(http.StatusBadRequest);_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:"Phone and text are required",Connected:true});return};s.mu.Lock();defer s.mu.Unlock();err:=safeSendMessage(uid,s.client,types.JID{User:phone,Server:types.DefaultUserServer},text);if err!=nil{_=json.NewEncoder(w).Encode(APIResponse{Status:"error",Message:err.Error(),Connected:s.client.IsConnected()});return};_=json.NewEncoder(w).Encode(APIResponse{Status:"success",Message:"Message sent with safety controls.",Connected:s.client.IsConnected()})}
