@@ -19,7 +19,6 @@ import (
 	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/socket"
 	"go.mau.fi/whatsmeow/util/keys"
-	"go.mau.fi/util/ptr"
 )
 
 const NoiseHandshakeResponseTimeout = 20 * time.Second
@@ -98,8 +97,6 @@ func (cli *Client) doHandshake(fs *socket.FrameSocket, ephemeralKP keys.KeyPair)
 		clientPayload = cli.GetClientPayload()
 	} else {
 		clientPayload = cli.Store.GetClientPayload()
-		// Set custom device name
-		clientPayload.DeviceName = ptr.Ptr("88Task")
 	}
 
 	clientFinishPayloadBytes, err := proto.Marshal(clientPayload)
