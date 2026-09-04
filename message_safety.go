@@ -71,13 +71,13 @@ func resolveCachedRecipient(client *whatsmeow.Client,pn types.JID)(types.JID,boo
 
 func resolveRecipientWithLIDFallback(ctx context.Context,client *whatsmeow.Client,pn types.JID)(types.JID,bool,error){
  if resolved,cached:=resolveCachedRecipient(client,pn);cached{return resolved,true,nil}
- phone:="+"+strings.TrimPrefix(strings.TrimSpace(pn.User),"+")
+ phone:="+"+pn.User
  results,err:=client.IsOnWhatsApp(ctx,[]string{phone})
  if err!=nil{return types.JID{},false,err}
  for _,info:=range results{
   if info.PhoneNumber.User!=""&&info.PhoneNumber.User!=pn.User{continue}
-  if info.JID.Server==types.HiddenUserServer&&!info.JID.IsEmpty(){
-   if lid,lookupErr:=client.Store.LIDs.GetLIDForPN(ctx,pn);lookupErr==nil&&!lid.IsEmpty(){return lid,true,nil}
+  if !info.JID.IsEmpty(){
+   if lid,lookupErr:=client.Store.LIDs.GetLIDForPN(ctx,info.JID);lookupErr==nil&&!lid.IsEmpty(){return lid,true,nil}
    return info.JID,true,nil
   }
  }
@@ -86,6 +86,7 @@ func resolveRecipientWithLIDFallback(ctx context.Context,client *whatsmeow.Clien
 
 func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,text string)error{
  if client==nil||!client.IsLoggedIn()||!client.IsConnected(){recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("WhatsApp is not connected"));return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("message text is required"));return fmt.Errorf("message text is required")};if targetJID.Server!=types.DefaultUserServer||strings.TrimSpace(targetJID.User)==""{recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("invalid WhatsApp recipient: %s",targetJID));return fmt.Errorf("invalid WhatsApp recipient: %s",targetJID)}
+ targetJID.User=strings.TrimPrefix(strings.TrimSpace(targetJID.User),"+")
  recordSendTelemetry(userID,targetJID.User,"attempt",nil)
  if recipientRateLimited(userID){err:=fmt.Errorf("WhatsApp recipient lookup temporarily rate-limited (429); waiting before retry");recordSendTelemetry(userID,targetJID.User,"rate_limited",err);return err}
  if err:=checkMessageSafety(userID);err!=nil{recordSendTelemetry(userID,targetJID.User,"safety_blocked",err);return err}
