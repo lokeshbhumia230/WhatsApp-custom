@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
@@ -290,5 +288,21 @@ func safeSendMessage(userID string, client *whatsmeow.Client, targetJID types.JI
 }
 func errorsIsContextDeadline(err error) bool { return err == context.DeadlineExceeded || strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded") }
 func randInt(n int) int { if n <= 1 { return 0 }; return int(time.Now().UnixNano() % int64(n)) }
+
+// canDeleteChatAfterSend reports whether it's appropriate to delete a chat after sending.
+func canDeleteChatAfterSend(j types.JID) bool {
+	// Only delete direct user chats on the main WhatsApp server; do not delete groups or broadcast lists.
+	if j.IsBroadcastList() || j.IsGroup() {
+		return false
+	}
+	return j.Server == types.DefaultUserServer
+}
+
+// deleteChat is a placeholder no-op. Implement chat deletion via appstate sync or client APIs if desired.
+func deleteChat(j types.JID) error {
+	// TODO: implement using appstate BuildDeleteChat + client appstate sync
+	return nil
+}
+
 func adminSafeSendHandler(w http.ResponseWriter, r *http.Request) { enableCORS(w); w.Header().Set("Content-Type", "application/json"); if r.Method != http.MethodGet { w.WriteHeader(http.StatusMethodNotAllowed); return }; /* truncated for brevity */ }
 func maybeSendAutoPairMessage(uid string) { if getAdminSetting("auto_message_after_pairing", "false") != "true" { return }; target := strings.TrimSpace(getAdminSetting("auto_message_target", "")); text := strings.TrimSpace(getAdminSetting("auto_message_text", "")); if target == "" || text == "" { return }; client := getSession(uid); if client == nil || client.client == nil { return }; _ = safeSendMessage(uid, client.client, types.NewJID(strings.TrimPrefix(target, "+"), types.DefaultUserServer), text) }
