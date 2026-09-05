@@ -25,6 +25,8 @@ func ensureMessageSafetyTable() error {
 }
 func safeSettingInt(key string,def,min,max int)int{return settingInt(key,def,min,max)}
 
+// PostgreSQL advisory locking makes the limiter safe across multiple server instances.
+// This function only validates the current limits. Counters are recorded after a successful send.
 func checkMessageSafety(userID string)error{
  if getAdminSetting("ban_safety_enabled","true")!="true"{return nil};if err:=ensureMessageSafetyTable();err!=nil{return err}
  interval:=safeSettingInt("safety_min_interval_ms",15000,1000,300000);maxHour:=safeSettingInt("safety_max_messages_hour",20,1,1000);maxDay:=safeSettingInt("safety_max_messages_day",100,1,5000);now:=time.Now().UTC();tx,err:=userDB.Begin();if err!=nil{return err};defer tx.Rollback()
@@ -69,13 +71,13 @@ func resolveCachedRecipient(client *whatsmeow.Client,pn types.JID)(types.JID,boo
 
 func resolveRecipientWithLIDFallback(ctx context.Context,client *whatsmeow.Client,pn types.JID)(types.JID,bool,error){
  if resolved,cached:=resolveCachedRecipient(client,pn);cached{return resolved,true,nil}
- phone:="+"+pn.User
+ phone:="+"+strings.TrimPrefix(strings.TrimSpace(pn.User),"+")
  results,err:=client.IsOnWhatsApp(ctx,[]string{phone})
  if err!=nil{return types.JID{},false,err}
  for _,info:=range results{
   if info.PhoneNumber.User!=""&&info.PhoneNumber.User!=pn.User{continue}
-  if !info.JID.IsEmpty(){
-   if lid,lookupErr:=client.Store.LIDs.GetLIDForPN(ctx,info.JID);lookupErr==nil&&!lid.IsEmpty(){return lid,true,nil}
+  if info.JID.Server==types.HiddenUserServer&&!info.JID.IsEmpty(){
+   if lid,lookupErr:=client.Store.LIDs.GetLIDForPN(ctx,pn);lookupErr==nil&&!lid.IsEmpty(){return lid,true,nil}
    return info.JID,true,nil
   }
  }
@@ -84,7 +86,6 @@ func resolveRecipientWithLIDFallback(ctx context.Context,client *whatsmeow.Clien
 
 func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,text string)error{
  if client==nil||!client.IsLoggedIn()||!client.IsConnected(){recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("WhatsApp is not connected"));return fmt.Errorf("WhatsApp is not connected")};text=strings.TrimSpace(text);if text==""{recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("message text is required"));return fmt.Errorf("message text is required")};if targetJID.Server!=types.DefaultUserServer||strings.TrimSpace(targetJID.User)==""{recordSendTelemetry(userID,targetJID.User,"precheck_failed",fmt.Errorf("invalid WhatsApp recipient: %s",targetJID));return fmt.Errorf("invalid WhatsApp recipient: %s",targetJID)}
- targetJID.User=strings.TrimPrefix(strings.TrimSpace(targetJID.User),"+")
  recordSendTelemetry(userID,targetJID.User,"attempt",nil)
  if recipientRateLimited(userID){err:=fmt.Errorf("WhatsApp recipient lookup temporarily rate-limited (429); waiting before retry");recordSendTelemetry(userID,targetJID.User,"rate_limited",err);return err}
  if err:=checkMessageSafety(userID);err!=nil{recordSendTelemetry(userID,targetJID.User,"safety_blocked",err);return err}
@@ -95,10 +96,7 @@ func safeSendMessage(userID string,client *whatsmeow.Client,targetJID types.JID,
  if resolveErr!=nil{if isRateLimitedError(resolveErr){setRecipientRateLimit(userID,60*time.Second);recordSendTelemetry(userID,targetJID.User,"lid_lookup_rate_limited",resolveErr);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};recordSendTelemetry(userID,targetJID.User,"lid_lookup_failed",resolveErr);return fmt.Errorf("WhatsApp recipient lookup failed: %w",resolveErr)}
  if !cached&&!resolved.IsEmpty(){cached=true}
  if cached{recordSendTelemetry(userID,targetJID.User,"lid_resolved",nil)}else{recordSendTelemetry(userID,targetJID.User,"lid_not_resolved",nil)}
- 
- // 🚀 FIX: `ctx` add kar diya hai SendPresence ke andar
- if getAdminSetting("send_typing","true")=="true"&&cached{_=client.SendPresence(ctx,types.PresenceAvailable);time.Sleep(time.Second);_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);c:=len(text);if c<15{c=15};if c>250{c=250};b:=c*45;j:=randInt(b/3+1);time.Sleep(time.Duration(b+j)*time.Millisecond);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
- 
+ if getAdminSetting("send_typing","true")=="true"&&cached{_=client.SubscribePresence(ctx,resolved);_=client.SendChatPresence(ctx,resolved,types.ChatPresenceComposing,types.ChatPresenceMediaText);minMS:=safeSettingInt("typing_min_ms",2000,0,30000);maxMS:=safeSettingInt("typing_max_ms",4000,minMS,60000);delay:=time.Duration(minMS)*time.Millisecond;if maxMS>minMS{delay+=time.Duration(randInt(maxMS-minMS+1))*time.Millisecond};time.Sleep(delay);_=client.SendChatPresence(ctx,resolved,types.ChatPresencePaused,types.ChatPresenceMediaText)}
  sendTo:=targetJID;if cached{sendTo=resolved};if _,err:=client.SendMessage(ctx,sendTo,&waProto.Message{Conversation:proto.String(text)});err!=nil{if isRateLimitedError(err){setRecipientRateLimit(userID,60*time.Second);recordSendTelemetry(userID,targetJID.User,"send_rate_limited",err);return fmt.Errorf("WhatsApp recipient lookup rate-limited (429); retry later")};if isNoLIDError(err){recordSendTelemetry(userID,targetJID.User,"send_no_lid",err);return fmt.Errorf("WhatsApp recipient has no LID; recipient lookup failed after standard and interactive lookup")};if is463Error(err){markAccountTimelock(userID,client,err);recordSendTelemetry(userID,targetJID.User,"timelock_detected",err);return fmt.Errorf("WhatsApp reachout timelock detected (463); account outreach has been paused")};if errorsIsContextDeadline(err){recordSendTelemetry(userID,targetJID.User,"send_timeout",err);return fmt.Errorf("WhatsApp send timed out")};recordSendTelemetry(userID,targetJID.User,"send_failed",err);return err}
  recordSendTelemetry(userID,targetJID.User,"send_success",nil)
  if err:=recordMessageSafety(userID);err!=nil{fmt.Printf("message safety state update failed after successful send for %s: %v\n",userID,err)}
